@@ -25,10 +25,12 @@ install:
     - popd && popd
     - git clone https://github.com/01org/TPM2.0-TSS.git
     - pushd TPM2.0-TSS
+    - git checkout 1.1.0
     - ./bootstrap && ./configure && make -j$(nproc) && sudo make install && popd
     - sudo ldconfig /usr/local/lib
     - git clone https://github.com/01org/tpm2-abrmd.git
     - pushd tpm2-abrmd
+    - git checkout 1.0.0
     - ./bootstrap && ./configure --with-dbuspolicydir=/etc/dbus-1/system.d && make -j$(nproc) && sudo make install && popd
     - sudo mkdir -p /var/lib/tpm
     - sudo groupadd tss && sudo useradd -M -d /var/lib/tpm -s /bin/false -g tss tss
