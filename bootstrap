@@ -1,6 +1,5 @@
 #! /bin/sh
 
-aclocal \
-&& autoconf \
-&& automake --add-missing
+AUTORECONF=${AUTORECONF:-autoreconf}
 
+${AUTORECONF} --install --sym
