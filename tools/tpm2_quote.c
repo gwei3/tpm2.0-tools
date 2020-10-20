@@ -1,472 +1,339 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
-#include <stdarg.h>
 #include <stdbool.h>
-
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <limits.h>
-#include <ctype.h>
-#include <getopt.h>
 
-#include <sapi/tpm20.h>
-#include <tcti/tcti_socket.h>
-
-#include "tpm2_util.h"
-#include "password_util.h"
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "pcr.h"
+#include "tpm2.h"
+#include "tpm2_alg_util.h"
+#include "tpm2_convert.h"
+#include "tpm2_openssl.h"
+#include "tpm2_systemdeps.h"
+#include "tpm2_tool.h"
 
-typedef struct {
-    int size;
-    UINT32 id[24];
-} PCR_LIST;
+typedef struct tpm_quote_ctx tpm_quote_ctx;
+struct tpm_quote_ctx {
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } key;
 
-TPMS_AUTH_COMMAND sessionData = {
-    .hmac = TPM2B_TYPE_INIT(TPM2B_AUTH, buffer),
+    char *signature_path;
+    char *message_path;
+    char *pcr_path;
+    FILE *pcr_output;
+    tpm2_convert_sig_fmt sig_format;
+    TPMI_ALG_HASH sig_hash_algorithm;
+    tpm2_algorithm algs;
+    TPM2B_DATA qualification_data;
+    TPML_PCR_SELECTION pcr_selections;
+    TPMS_CAPABILITY_DATA cap_data;
+    tpm2_pcrs pcrs;
+
+    char *cp_hash_path;
 };
 
-bool hexPasswd = false;
-char *outFilePath;
-TPM2B_DATA qualifyingData = TPM2B_EMPTY_INIT;
-TPML_PCR_SELECTION  pcrSelections;
-bool is_auth_session;
-TPMI_SH_AUTH_SESSION auth_session_handle;
+static tpm_quote_ctx ctx = {
+    .sig_hash_algorithm = TPM2_ALG_NULL,
+    .qualification_data = TPM2B_EMPTY_INIT,
+};
 
-void PrintBuffer( UINT8 *buffer, UINT32 size )
-{
+
+// write all PCR banks according to g_pcrSelection & g_pcrs->
+static bool write_pcr_values() {
+    UINT32 count;
+
+    // PCR output to file wasn't requested
+    if (ctx.pcr_output == NULL) {
+        return true;
+    }
+
+    // Make sure the file content is written in little endian format
+    ctx.pcr_selections.count = htole32(ctx.pcr_selections.count);
     UINT32 i;
-    for( i = 0; i < size; i++ )
-    {
-        printf( "%2.2x", buffer[i] );
-    }
-    printf( "\n" );
-}
+    for (i = 0; i < le32toh(ctx.pcr_selections.count); i++)
+        ctx.pcr_selections.pcrSelections[i].hash = htole16(ctx.pcr_selections.pcrSelections[i].hash);
 
-#if 0
-void PrintTPM2B_ATTEST( TPM2B_ATTEST *attest )
-{
-    TPMS_ATTEST *s_att = (TPMS_ATTEST *)&attest->t.attestationData[0];
-
-    printf( "ATTEST_2B:\n" );
-    printf( "\tsize = 0x%4.4x\n", attest->t.size ); //already little endian
-    printf( "\tattestationData(TPMS_ATTEST):\n" );
-    printf( "\t\tmagic = 0x%8.8x\n", ntohl(s_att->magic) );//big endian
-    printf( "\t\ttype  = 0x%4.4x\n", ntohs(s_att->type) );
-    printf( "\t\tqualifiedSigner(NAME_2B):\n" );
-    printf( "\t\t\tsize = 0x%4.4x\n", ntohs(s_att->qualifiedSigner.t.size) );
-    printf( "\t\t\tname = " );
-    PrintBuffer( s_att->qualifiedSigner.b.buffer, ntohs(s_att->qualifiedSigner.b.size) );
-    s_att = (TPMS_ATTEST *)(((BYTE *)s_att) - sizeof(s_att->qualifiedSigner.t) + ntohs(s_att->qualifiedSigner.t.size) + 2);
-    printf( "\t\textraData(DATA_2B):\n" );
-    printf( "\t\t\tsize   = 0x%4.4x\n", ntohs(s_att->extraData.t.size) );
-    printf( "\t\t\tbuffer = " );
-    PrintBuffer( s_att->extraData.b.buffer, ntohs(s_att->extraData.b.size) );
-    s_att = (TPMS_ATTEST *)(((BYTE *)s_att) - sizeof(s_att->extraData.t) + ntohs(s_att->extraData.t.size) + 2);
-    printf( "\t\tclockInfo(TPMS_CLOCK_INFO):\n" );
-    printf( "\t\t\tclock        = 0x%16.16lx\n", s_att->clockInfo.clock );
-    printf( "\t\t\tresetCount   = 0x%8.8x\n", ntohl(s_att->clockInfo.resetCount) );
-    printf( "\t\t\trestartCount = 0x%8.8x\n", ntohl(s_att->clockInfo.restartCount) );
-    printf( "\t\t\tsafe         = 0x%2.2x\n", s_att->clockInfo.safe );
-
-    s_att = (TPMS_ATTEST *)(((BYTE *)s_att) - 7);
-    printf( "\t\tfirmwareVersion = 0x%16.16lx\n", s_att->firmwareVersion );
-    printf( "\t\tattested(TPMS_QUOTE_INFO):\n" );
-    printf( "\t\t\tpcrSelect(TPML_PCR_SELECTION):\n" );
-    printf( "\t\t\t\tcount = 0x%8.8x\n", ntohl(s_att->attested.quote.pcrSelect.count) );
-    for ( UINT32 i = 0; i < ntohl(s_att->attested.quote.pcrSelect.count); i++ )
-    {
-        TPMS_PCR_SELECTION *s = &s_att->attested.quote.pcrSelect.pcrSelections[i];
-        printf( "\t\t\t\tpcrSelections[%d](TPMS_PCR_SELECTION):\n", i );
-        printf( "\t\t\t\t\thash = 0x%4.4x\n", ntohs(s->hash) );
-        printf( "\t\t\t\t\tsizeofSelect = 0x%2.2x\n", s->sizeofSelect );
-        printf( "\t\t\t\t\tpcrSelect = " );
-        PrintBuffer( s->pcrSelect, s->sizeofSelect );
-    }
-    s_att = (TPMS_ATTEST *)(((BYTE *)s_att) - sizeof(s_att->attested.quote.pcrSelect) + ntohl(s_att->attested.quote.pcrSelect.count) * sizeof(TPMS_PCR_SELECTION) + 4 );
-    printf( "\t\t\tpcrDigest(DIGEST_2B):\n" );
-    printf( "\t\t\t\tsize = 0x%4.4x\n", ntohs(s_att->attested.quote.pcrDigest.t.size) );
-    printf( "\t\t\t\tbuffer = " );
-    PrintBuffer( s_att->attested.quote.pcrDigest.b.buffer, ntohs(s_att->attested.quote.pcrDigest.b.size) );
-}
-
-void PrintTPMT_SIGNATURE( TPMT_SIGNATURE *sig )
-{
-    printf( "TPMT_SIGNATURE:\n" );
-    printf( "\tsigAlg = 0x%4.4x\n", sig->sigAlg );
-    printf( "\tsignature(TPMU_SIGNATURE):\n" );
-    switch ( sig->sigAlg )
-    {
-        case TPM_ALG_RSASSA:
-        case TPM_ALG_RSAPSS:
-            printf( "\t\tTPMS_SIGNATURE_RSA:\n" );
-            printf( "\t\t\thash = 0x%4.4x\n", sig->signature.rsassa.hash );
-            printf( "\t\t\tsig(PUBLIC_KEY_RSA_2B):\n" );
-            printf( "\t\t\t\tsize = 0x%4.4x\n", sig->signature.rsassa.sig.t.size );
-            printf( "\t\t\t\tbuffer = " );
-            PrintSizedBuffer( &sig->signature.rsassa.sig.b );
-            break;
-        case TPM_ALG_ECDSA:
-        case TPM_ALG_ECDAA:
-        case TPM_ALG_SM2:
-        case TPM_ALG_ECSCHNORR:
-            printf( "\t\tTPMS_SIGNATURE_ECC:\n" );
-            printf( "\t\t\thash = 0x%4.4x\n", sig->signature.ecdsa.hash);
-            printf( "\t\t\tsignatureR(TPM2B_ECC_PARAMETER):\n" );
-            printf( "\t\t\t\tsize = 0x%4.4x\n", sig->signature.ecdsa.signatureR.t.size );
-            printf( "\t\t\t\tbuffer = " );
-            PrintSizedBuffer( &sig->signature.ecdsa.signatureR.b );
-            printf( "\t\t\tsignatureS(TPM2B_ECC_PARAMETER):\n" );
-            printf( "\t\t\t\tsize = 0x%4.4x\n", sig->signature.ecdsa.signatureS.t.size );
-            printf( "\t\t\t\tbuffer = " );
-            PrintSizedBuffer( &sig->signature.ecdsa.signatureS.b );
-            break;
-        case TPM_ALG_HMAC:
-            printf( "\t\tTPMS_HA:\n" );
-            printf( "\t\t\thashAlg = 0x%4.4x\n", sig->signature.hmac.hashAlg);
-            printf( "\t\t\tdigest = " );
-            UINT16 size = 0;
-            switch ( sig->signature.hmac.hashAlg )
-            {
-                case TPM_ALG_SHA1:    size = SHA1_DIGEST_SIZE;    break;
-                case TPM_ALG_SHA256:  size = SHA256_DIGEST_SIZE;  break;
-                case TPM_ALG_SHA384:  size = SHA384_DIGEST_SIZE;  break;
-                case TPM_ALG_SHA512:  size = SHA512_DIGEST_SIZE;  break;
-                case TPM_ALG_SM3_256: size = SM3_256_DIGEST_SIZE; break;
-            }
-            PrintBuffer( (BYTE *)&sig->signature.hmac.digest, size );
-            break;
-    }
-}
-#endif
-
-UINT16 calcSizeofTPM2B_ATTEST( TPM2B_ATTEST *attest )
-{
-    return 2 + attest->b.size;
-}
-
-UINT16  calcSizeofTPMT_SIGNATURE( TPMT_SIGNATURE *sig )
-{
-    UINT16 size = 2;
-    switch ( sig->sigAlg )
-    {
-        case TPM_ALG_RSASSA:
-        case TPM_ALG_RSAPSS:
-            size += 2 + 2 + sig->signature.rsassa.sig.t.size;
-            break;
-        case TPM_ALG_ECDSA:
-        case TPM_ALG_ECDAA:
-        case TPM_ALG_SM2:
-        case TPM_ALG_ECSCHNORR:
-            size += 2 + 2*sizeof(TPM2B_ECC_PARAMETER);
-            break;
-        case TPM_ALG_HMAC:
-            size += 2;
-            switch ( sig->signature.hmac.hashAlg )
-            {
-                case TPM_ALG_SHA1:    size += SHA1_DIGEST_SIZE;    break;
-                case TPM_ALG_SHA256:  size += SHA256_DIGEST_SIZE;  break;
-                case TPM_ALG_SHA384:  size += SHA384_DIGEST_SIZE;  break;
-                case TPM_ALG_SHA512:  size += SHA512_DIGEST_SIZE;  break;
-                case TPM_ALG_SM3_256: size += SM3_256_DIGEST_SIZE; break;
-                default: size = 0; break;
-            }
-            break;
-        default:
-            size = 0;
-            break;
+    // Export TPML_PCR_SELECTION structure to pcr outfile
+    if (fwrite(&ctx.pcr_selections, sizeof(TPML_PCR_SELECTION), 1,
+            ctx.pcr_output) != 1) {
+        LOG_ERR("write to output file failed: %s", strerror(errno));
+        return false;
     }
 
-    return size > sizeof(*sig) ? sizeof(*sig) : size;
-}
-
-int quote(TSS2_SYS_CONTEXT *sapi_context, TPM_HANDLE akHandle, TPML_PCR_SELECTION *pcrSelection)
-{
-    UINT32 rval;
-    TPMT_SIG_SCHEME inScheme;
-    TPMS_AUTH_RESPONSE sessionDataOut;
-    TSS2_SYS_CMD_AUTHS sessionsData;
-    TSS2_SYS_RSP_AUTHS sessionsDataOut;
-    TPM2B_ATTEST quoted = TPM2B_TYPE_INIT(TPM2B_ATTEST, attestationData);
-    TPMT_SIGNATURE signature;
-
-    TPMS_AUTH_COMMAND *sessionDataArray[1];
-    TPMS_AUTH_RESPONSE *sessionDataOutArray[1];
-
-    sessionDataArray[0] = &sessionData;
-    sessionDataOutArray[0] = &sessionDataOut;
-
-    sessionsDataOut.rspAuths = &sessionDataOutArray[0];
-    sessionsData.cmdAuths = &sessionDataArray[0];
-
-    sessionsDataOut.rspAuthsCount = 1;
-    sessionsData.cmdAuthsCount = 1;
-
-    sessionData.sessionHandle = TPM_RS_PW;
-    if (is_auth_session) {
-        sessionData.sessionHandle = auth_session_handle;
+    count = htole32(ctx.pcrs.count);
+    // Export PCR digests to pcr outfile
+    if (fwrite(&count, sizeof(UINT32), 1, ctx.pcr_output) != 1) {
+        LOG_ERR("write to output file failed: %s", strerror(errno));
+        return false;
     }
 
-    sessionData.nonce.t.size = 0;
-    *( (UINT8 *)((void *)&sessionData.sessionAttributes ) ) = 0;
-    if (sessionData.hmac.t.size > 0 && hexPasswd)
-    {
-        sessionData.hmac.t.size = sizeof(sessionData.hmac) - 2;
-        if (tpm2_util_hex_to_byte_structure((char *)sessionData.hmac.t.buffer,
-                              &sessionData.hmac.t.size,
-                              sessionData.hmac.t.buffer) != 0)
-        {
-            printf( "Failed to convert Hex format password for AK Passwd.\n");
-            return -1;
+    UINT32 j;
+    for (j = 0; j < ctx.pcrs.count; j++) {
+        ctx.pcrs.pcr_values[j].count = htole32(ctx.pcrs.pcr_values[j].count);
+
+        UINT32 k;
+        for(k = 0; k < le32toh(ctx.pcrs.pcr_values[j].count); k++)
+            ctx.pcrs.pcr_values[j].digests[k].size = htole16(ctx.pcrs.pcr_values[j].digests[k].size);
+
+        if (fwrite(&ctx.pcrs.pcr_values[j], sizeof(TPML_DIGEST), 1,
+                ctx.pcr_output) != 1) {
+            LOG_ERR("write to output file failed: %s", strerror(errno));
+            return false;
         }
     }
 
-    inScheme.scheme = TPM_ALG_NULL;
-
-    memset( (void *)&signature, 0, sizeof(signature) );
-
-    rval = Tss2_Sys_Quote(sapi_context, akHandle, &sessionsData,
-            &qualifyingData, &inScheme, pcrSelection, &quoted,
-            &signature, &sessionsDataOut );
-    if(rval != TPM_RC_SUCCESS)
-    {
-        printf("\nQuote Failed ! ErrorCode: 0x%0x\n\n", rval);
-        return -1;
-    }
-
-    printf( "\nquoted:\n " );
-    tpm2_util_print_tpm2b( (TPM2B *)&quoted );
-    //PrintTPM2B_ATTEST(&quoted);
-    printf( "\nsignature:\n " );
-    PrintBuffer( (UINT8 *)&signature, sizeof(signature) );
-    //PrintTPMT_SIGNATURE(&signature);
-
-    FILE *fp = fopen(outFilePath,"w+");
-    if(NULL == fp)
-    {
-        printf("OutFile: %s Can Not Be Created !\n",outFilePath);
-        return -2;
-    }
-    if(fwrite(&quoted, calcSizeofTPM2B_ATTEST(&quoted), 1 ,fp) != 1)
-    {
-        fclose(fp);
-        printf("OutFile: %s Write quoted Data In Error!\n",outFilePath);
-        return -3;
-    }
-    if(fwrite(&signature, calcSizeofTPMT_SIGNATURE(&signature), 1, fp) != 1)
-    {
-        fclose(fp);
-        printf("OutFile: %s Write signature Data In Error!\n",outFilePath);
-        return -4;
-    }
-
-    fclose(fp);
-    return 0;
+    return true;
 }
 
-int execute_tool (int argc, char *argv[], char *envp[], common_opts_t *opts,
-              TSS2_SYS_CONTEXT *sapi_context) {
+static bool write_output_files(TPM2B_ATTEST *quoted, TPMT_SIGNATURE *signature) {
 
-    (void) envp;
-    (void) opts;
-
-    int opt = -1;
-    const char *optstring = "hvk:c:P:l:g:L:o:S:Xq:";
-    static struct option long_options[] = {
-        {"help",0,NULL,'h'},
-        {"version",0,NULL,'v'},
-        {"akHandle",1,NULL,'k'},
-        {"akContext",1,NULL,'c'},
-        {"akPassword",1,NULL,'P'},  //add ak auth
-        {"idList",1,NULL,'l'},
-        {"algorithm",1,NULL,'g'},
-        {"selList",1,NULL,'L'},
-        {"outFile",1,NULL,'o'},
-        {"passwdInHex",0,NULL,'X'},
-        {"qualifyData",1,NULL,'q'},
-        {"input-session-handle",1,NULL,'S'},
-        {0,0,0,0}
-    };
-
-    char *contextFilePath = NULL;
-    TPM_HANDLE akHandle;
-
-    int returnVal = 0;
-    int flagCnt = 0;
-    int k_flag = 0,
-        c_flag = 0,
-        P_flag = 0,
-        l_flag = 0,
-        g_flag = 0,
-        L_flag = 0,
-        o_flag = 0;
-
-    if(argc == 1)
-    {
-        LOG_ERR("Invalid usage, try --help for help!");
-        return 0;
+    bool res = true;
+    if (ctx.signature_path) {
+        res &= tpm2_convert_sig_save(signature, ctx.sig_format,
+                ctx.signature_path);
     }
-    while((opt = getopt_long(argc,argv,optstring,long_options,NULL)) != -1)
-    {
-        switch(opt)
-        {
-        case 'k':
-            if(!tpm2_util_string_to_uint32(optarg,&akHandle))
-            {
-                showArgError(optarg, argv[0]);
-                returnVal = -1;
-                break;
-            }
-            k_flag = 1;
-            break;
-        case 'c':
-            contextFilePath = optarg;
-            if(contextFilePath == NULL || contextFilePath[0] == '\0')
-            {
-                showArgError(optarg, argv[0]);
-                returnVal = -2;
-                break;
-            }
-            printf("contextFile = %s\n", contextFilePath);
-            c_flag = 1;
-            break;
 
-        case 'P':
-            if(!password_tpm2_util_copy_password(optarg, "parent key", &sessionData.hmac))
-            {
-                showArgError(optarg, argv[0]);
-                returnVal = -3;
-                break;
-            }
-            P_flag = 1;
-            break;
-        case 'l':
-            if(!pcr_parse_list(optarg, strlen(optarg), &pcrSelections.pcrSelections[0]))
-            {
-                showArgError(optarg, argv[0]);
-                returnVal = -4;
-                break;
-            }
-            l_flag = 1;
-            break;
-        case 'g':
-            if(!tpm2_util_string_to_uint16(optarg,&pcrSelections.pcrSelections[0].hash))
-            {
-                showArgError(optarg, argv[0]);
-                returnVal = -5;
-                break;
-            }
-            pcrSelections.count = 1;
-            g_flag = 1;
-            break;
-        case 'L':
-            if(!pcr_parse_selections(optarg, &pcrSelections))
-            {
-                showArgError(optarg, argv[0]);
-                returnVal = -15;
-                break;
-            }
-            L_flag = 1;
-            break;
-        case 'o':
-            outFilePath = optarg;
-            if(files_does_file_exist(outFilePath))
-            {
-                showArgError(optarg, argv[0]);
-                returnVal = -6;
-                break;
-            }
-            o_flag = 1;
-            break;
-        case 'X':
-            hexPasswd = true;
-            break;
-        case 'q':
-            qualifyingData.t.size = sizeof(qualifyingData) - 2;
-            if(tpm2_util_hex_to_byte_structure(optarg,&qualifyingData.t.size,qualifyingData.t.buffer) != 0)
-            {
-                showArgError(optarg, argv[0]);
-                returnVal = -14;
-                break;
-            }
-            break;
-        case 'S':
-             if (!tpm2_util_string_to_uint32(optarg, &auth_session_handle)) {
-                 LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                         optarg);
-                 return 1;
-             }
-             is_auth_session = true;
-             break;
-       case ':':
-            //              printf("Argument %c needs a value!\n",optopt);
-            returnVal = -9;
-            break;
-        case '?':
-            //              printf("Unknown Argument: %c\n",optopt);
-            returnVal = -10;
-            break;
-            //default:
-            //  break;
+    if (ctx.message_path) {
+        res &= files_save_bytes_to_file(ctx.message_path,
+                (UINT8*) quoted->attestationData, quoted->size);
+    }
+
+    res &= write_pcr_values();
+
+    return res;
+}
+
+static tool_rc quote(ESYS_CONTEXT *ectx, TPML_PCR_SELECTION *pcr_selection) {
+
+    TPM2B_ATTEST *quoted = NULL;
+    TPMT_SIGNATURE *signature = NULL;
+    TPMT_SIG_SCHEME in_scheme = { .scheme = TPM2_ALG_NULL };
+
+    tool_rc rc = tpm2_alg_util_get_signature_scheme(ectx,
+            ctx.key.object.tr_handle, &ctx.sig_hash_algorithm, TPM2_ALG_NULL,
+            &in_scheme);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    if (ctx.cp_hash_path) {
+        TPM2B_DIGEST cp_hash = { .size = 0 };
+        rc = tpm2_quote(ectx, &ctx.key.object, &in_scheme,
+        &ctx.qualification_data, pcr_selection, &quoted, &signature, &cp_hash);
+        if (rc != tool_rc_success) {
+            return rc;
         }
-        if(returnVal)
-            break;
+
+        bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+        if (!result) {
+            rc = tool_rc_general_error;
+        }
+
+        return rc;
+    }
+
+    rc = tpm2_quote(ectx, &ctx.key.object, &in_scheme, &ctx.qualification_data,
+            pcr_selection, &quoted, &signature, NULL);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    tpm2_tool_output("quoted: ");
+    tpm2_util_print_tpm2b(quoted);
+    tpm2_tool_output("\nsignature:\n");
+    tpm2_tool_output("  alg: %s\n",
+            tpm2_alg_util_algtostr(signature->sigAlg, tpm2_alg_util_flags_sig));
+
+    UINT16 size;
+    BYTE *sig = tpm2_convert_sig(&size, signature);
+    if (!sig) {
+        return tool_rc_general_error;
+    }
+    tpm2_tool_output("  sig: ");
+    tpm2_util_hexdump(sig, size);
+    tpm2_tool_output("\n");
+    free(sig);
+
+    if (ctx.pcr_output) {
+        // Filter out invalid/unavailable PCR selections
+        if (!pcr_check_pcr_selection(&ctx.cap_data, &ctx.pcr_selections)) {
+            LOG_ERR("Failed to filter unavailable PCR values for quote!");
+            return tool_rc_general_error;
+        }
+
+        // Gather PCR values from the TPM (the quote doesn't have them!)
+        rc = pcr_read_pcr_values(ectx, &ctx.pcr_selections, &ctx.pcrs);
+        if (rc != tool_rc_success) {
+            LOG_ERR("Failed to retrieve PCR values related to quote!");
+            return rc;
+        }
+
+        // Grab the digest from the quote
+        TPMS_ATTEST attest;
+        rc = files_tpm2b_attest_to_tpms_attest(quoted, &attest);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+
+        // Print out PCR values as output
+        if (!pcr_print_pcr_struct(&ctx.pcr_selections, &ctx.pcrs)) {
+            LOG_ERR("Failed to print PCR values related to quote!");
+            return tool_rc_general_error;
+        }
+
+        // Calculate the digest from our selected PCR values (to ensure correctness)
+        TPM2B_DIGEST pcr_digest = TPM2B_TYPE_INIT(TPM2B_DIGEST, buffer);
+        if (!tpm2_openssl_hash_pcr_banks(ctx.sig_hash_algorithm,
+                &ctx.pcr_selections, &ctx.pcrs, &pcr_digest)) {
+            LOG_ERR("Failed to hash PCR values related to quote!");
+            return tool_rc_general_error;
+        }
+        tpm2_tool_output("calcDigest: ");
+        tpm2_util_hexdump(pcr_digest.buffer, pcr_digest.size);
+        tpm2_tool_output("\n");
+
+        // Make sure digest from quote matches calculated PCR digest
+        if (!tpm2_util_verify_digests(&attest.attested.quote.pcrDigest, &pcr_digest)) {
+            LOG_ERR("Error validating calculated PCR composite with quote");
+            return tool_rc_general_error;
+        }
+    }
+
+    // Write everything out
+    bool res = write_output_files(quoted, signature);
+
+    free(quoted);
+    free(signature);
+
+    return res ? tool_rc_success : tool_rc_general_error;
+}
+
+static bool on_option(char key, char *value) {
+
+    switch (key) {
+    case 'c':
+        ctx.key.ctx_path = value;
+        break;
+    case 'p':
+        ctx.key.auth_str = value;
+        break;
+    case 'l':
+        if (!pcr_parse_selections(value, &ctx.pcr_selections)) {
+            LOG_ERR("Could not parse pcr selections, got: \"%s\"", value);
+            return false;
+        }
+        break;
+    case 'q':
+        ctx.qualification_data.size = sizeof(ctx.qualification_data.buffer);
+        return tpm2_util_bin_from_hex_or_file(value, &ctx.qualification_data.size,
+                ctx.qualification_data.buffer);
+        break;
+    case 's':
+        ctx.signature_path = value;
+        break;
+    case 'm':
+        ctx.message_path = value;
+        break;
+    case 'o':
+        ctx.pcr_path = value;
+        break;
+    case 'f':
+        ctx.sig_format = tpm2_convert_sig_fmt_from_optarg(value);
+
+        if (ctx.sig_format == signature_format_err) {
+            return false;
+        }
+        break;
+    case 'g':
+        ctx.sig_hash_algorithm = tpm2_alg_util_from_optarg(value,
+                tpm2_alg_util_flags_hash);
+        if (ctx.sig_hash_algorithm == TPM2_ALG_ERROR) {
+            LOG_ERR(
+                    "Could not convert signature hash algorithm selection, got: \"%s\"",
+                    value);
+            return false;
+        }
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
+    }
+
+    return true;
+}
+
+static bool tpm2_tool_onstart(tpm2_options **opts) {
+
+    static const struct option topts[] = {
+        { "key-context",    required_argument, NULL, 'c' },
+        { "auth",           required_argument, NULL, 'p' },
+        { "pcr-list",       required_argument, NULL, 'l' },
+        { "qualification",  required_argument, NULL, 'q' },
+        { "signature",      required_argument, NULL, 's' },
+        { "message",        required_argument, NULL, 'm' },
+        { "pcr",            required_argument, NULL, 'o' },
+        { "format",         required_argument, NULL, 'f' },
+        { "hash-algorithm", required_argument, NULL, 'g' },
+        { "cphash",         required_argument, NULL,  0  }
     };
 
-    if(returnVal != 0)
-        return returnVal;
+    *opts = tpm2_options_new("c:p:l:q:s:m:o:f:g:", ARRAY_LEN(topts), topts,
+            on_option, NULL, 0);
 
-    flagCnt = k_flag + c_flag + l_flag + g_flag + L_flag + o_flag;
-    if(((flagCnt == 3 && L_flag) || (flagCnt == 4 && (g_flag && l_flag)))
-             && (k_flag || c_flag) && o_flag)
-    {
-        if(P_flag == 0)
-            sessionData.hmac.t.size = 0;
-
-        if(c_flag)
-            returnVal = file_load_tpm_context_from_file(sapi_context, &akHandle, contextFilePath) != true;
-        if(returnVal == TPM_RC_SUCCESS)
-            returnVal = quote(sapi_context, akHandle, &pcrSelections);
-        if(returnVal)
-            return -12;
-    }
-    else
-    {
-        showArgMismatch(argv[0]);
-        return -13;
-    }
-
-    return 0;
+    return *opts != NULL;
 }
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    /* TODO this whole file needs to be re-done, especially the option validation */
+    if (!ctx.pcr_selections.count) {
+        LOG_ERR("Expected -l to be specified.");
+        return tool_rc_option_error;
+    }
+
+    if (ctx.cp_hash_path && (ctx.signature_path || ctx.message_path)) {
+        LOG_ERR("Cannot produce output when calculating cpHash");
+        return tool_rc_option_error;
+    }
+
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.key.ctx_path,
+            ctx.key.auth_str, &ctx.key.object, false, TPM2_HANDLE_ALL_W_NV);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid key authorization");
+        return rc;
+    }
+
+    if (ctx.pcr_path) {
+        ctx.pcr_output = fopen(ctx.pcr_path, "wb+");
+        if (!ctx.pcr_output) {
+            LOG_ERR("Could not open PCR output file \"%s\" error: \"%s\"",
+                    ctx.pcr_path, strerror(errno));
+            return tool_rc_general_error;
+        }
+    }
+
+    rc = pcr_get_banks(ectx, &ctx.cap_data, &ctx.algs);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    return quote(ectx, &ctx.pcr_selections);
+}
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+    if (ctx.pcr_output) {
+        fclose(ctx.pcr_output);
+    }
+    return tpm2_session_close(&ctx.key.object.session);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("quote", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

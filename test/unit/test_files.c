@@ -1,38 +1,13 @@
-//**********************************************************************;
-// Copyright (c) 2016, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
-#include <errno.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <setjmp.h>
+/* SPDX-License-Identifier: BSD-3-Clause */
 
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <setjmp.h>
 #include <cmocka.h>
-#include <sapi/tpm20.h>
 
 #include "files.h"
 
@@ -87,14 +62,14 @@ static int test_setup(void **state) {
 
 static int test_teardown(void **state) {
 
-    test_file *tf = (test_file *)*state;
+    test_file *tf = (test_file *) *state;
     test_file_free(tf);
     return 0;
 }
 
 static test_file *test_file_from_state(void **state) {
 
-    test_file *f = (test_file *)*state;
+    test_file *f = (test_file *) *state;
     assert_non_null(f);
     return f;
 }
@@ -134,6 +109,7 @@ static void test_file_read_write_bytes(void **state) {
 
     UINT8 found[1024] = { 0 };
     res = files_read_bytes(f, found, sizeof(found));
+    assert_true(res);
 
     assert_memory_equal(expected, found, sizeof(found));
 }
@@ -220,8 +196,8 @@ static void test_file_size(void **state) {
     int rc = fflush(tf->file);
     assert_return_code(rc, errno);
 
-    long file_size;
-    res = files_get_file_size(tf->path, &file_size);
+    unsigned long file_size;
+    res = files_get_file_size_path(tf->path, &file_size);
     assert_true(res);
 
     assert_int_equal(file_size, sizeof(data));
@@ -229,16 +205,17 @@ static void test_file_size(void **state) {
 
 static void test_file_size_bad_args(void **state) {
 
-    long file_size;
-    bool res = files_get_file_size("this_should_be_a_bad_path", &file_size);
+    unsigned long file_size;
+    bool res = files_get_file_size_path("this_should_be_a_bad_path",
+            &file_size);
     assert_false(res);
 
-    res = files_get_file_size(NULL, &file_size);
+    res = files_get_file_size_path(NULL, &file_size);
     assert_false(res);
 
     test_file *tf = test_file_from_state(state);
 
-    res = files_get_file_size(tf->path, NULL);
+    res = files_get_file_size_path(tf->path, NULL);
     assert_false(res);
 }
 
@@ -261,9 +238,14 @@ static void test_file_exists_bad_args(void **state) {
     assert_false(res);
 }
 
+/* link required symbol, but tpm2_tool.c declares it AND main, which
+ * we have a main below for cmocka tests.
+ */
+bool output_enabled = true;
+
 int main(int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
+    (void) argc;
+    (void) argv;
 
     const struct CMUnitTest tests[] = {
         cmocka_unit_test_setup_teardown(test_file_read_write_16,

@@ -1,298 +1,401 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
-
+/* SPDX-License-Identifier: BSD-3-Clause */
 #include <stdbool.h>
 #include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <getopt.h>
-#include <limits.h>
-
-#include <sapi/tpm20.h>
 
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
+#include "tpm2.h"
+#include "tpm2_attr_util.h"
+#include "tpm2_auth_util.h"
+#include "tpm2_nv_util.h"
+#include "tpm2_options.h"
+#include "tpm2_tool.h"
 
 typedef struct tpm_nvdefine_ctx tpm_nvdefine_ctx;
 struct tpm_nvdefine_ctx {
-    UINT32 nvIndex;
-    UINT32 authHandle;
-    UINT32 size;
-    UINT32 nvAttribute;
-    TPM2B_AUTH handlePasswd;
-    TPM2B_AUTH indexPasswd;
-    bool hexPasswd;
-    TSS2_SYS_CONTEXT *sapi_context;
-    bool enforce_read_policy;
-    bool enforce_write_policy;
-    bool enforce_delete_policy;
-    bool policy_file_flag;
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } auth_hierarchy;
+
+    TPMI_RH_NV_INDEX nv_index;
+    bool size_set;
+    UINT16 size;
+    TPMA_NV nv_attribute;
+    TPM2B_AUTH nv_auth;
+
     char *policy_file;
-    bool is_auth_session;
-    TPMI_SH_AUTH_SESSION auth_session_handle;
+    char *index_auth_str;
+
+    char *cp_hash_path;
 };
 
-static int nv_space_define(tpm_nvdefine_ctx *ctx) {
+static tpm_nvdefine_ctx ctx = {
+    .auth_hierarchy = {
+        .ctx_path = "o",
+    },
+    .nv_auth = TPM2B_EMPTY_INIT,
+};
+
+static tool_rc nv_space_define(ESYS_CONTEXT *ectx) {
 
     TPM2B_NV_PUBLIC public_info = TPM2B_EMPTY_INIT;
-    TPMS_AUTH_COMMAND session_data = {
-        .sessionHandle = TPM_RS_PW,
-        .nonce = TPM2B_EMPTY_INIT,
-        .hmac = TPM2B_EMPTY_INIT,
-        .sessionAttributes = SESSION_ATTRIBUTES_INIT(0),
-    };
 
-    if (ctx->is_auth_session) {
-        session_data.sessionHandle = ctx->auth_session_handle;
-    }
-
-    TPMS_AUTH_RESPONSE session_data_out;
-    TSS2_SYS_CMD_AUTHS sessions_data;
-    TSS2_SYS_RSP_AUTHS sessions_data_out;
-
-    TPMS_AUTH_COMMAND *session_data_array[1] = {
-        &session_data
-    };
-
-    TPMS_AUTH_RESPONSE *session_data_out_array[1] = {
-        &session_data_out
-    };
-
-    sessions_data_out.rspAuths = &session_data_out_array[0];
-    sessions_data.cmdAuths = &session_data_array[0];
-
-    sessions_data_out.rspAuthsCount = 1;
-    sessions_data.cmdAuthsCount = 1;
-
-    bool result = password_tpm2_util_to_auth(&ctx->handlePasswd, ctx->hexPasswd,
-            "handle password", &session_data.hmac);
-    if (!result) {
-        return false;
-    }
-
-    public_info.t.size = sizeof(TPMI_RH_NV_INDEX) + sizeof(TPMI_ALG_HASH)
-            + sizeof(TPMA_NV) + sizeof(UINT16) + sizeof(UINT16);
-    public_info.t.nvPublic.nvIndex = ctx->nvIndex;
-    public_info.t.nvPublic.nameAlg = TPM_ALG_SHA256;
+    public_info.nvPublic.nvIndex = ctx.nv_index;
+    public_info.nvPublic.nameAlg = TPM2_ALG_SHA256;
 
     // Now set the attributes.
-    public_info.t.nvPublic.attributes.val = ctx->nvAttribute;
-    public_info.t.nvPublic.attributes.TPMA_NV_POLICYREAD = ctx->enforce_read_policy;
-    public_info.t.nvPublic.attributes.TPMA_NV_POLICYWRITE = ctx->enforce_write_policy;
-    public_info.t.nvPublic.attributes.TPMA_NV_POLICY_DELETE = ctx->enforce_delete_policy;
+    public_info.nvPublic.attributes = ctx.nv_attribute;
 
-    if (ctx->policy_file_flag) {
-        public_info.t.nvPublic.authPolicy.t.size  = BUFFER_SIZE(TPM2B_DIGEST, buffer);
-        if(!files_load_bytes_from_file(ctx->policy_file, public_info.t.nvPublic.authPolicy.t.buffer, &public_info.t.nvPublic.authPolicy.t.size )) {
+    if (!ctx.size) {
+        LOG_WARN("Defining an index with size 0");
+    }
+
+    if (ctx.policy_file) {
+        public_info.nvPublic.authPolicy.size = BUFFER_SIZE(TPM2B_DIGEST,
+                buffer);
+        if (!files_load_bytes_from_path(ctx.policy_file,
+                public_info.nvPublic.authPolicy.buffer,
+                &public_info.nvPublic.authPolicy.size)) {
+            return tool_rc_general_error;
+        }
+    }
+
+    public_info.nvPublic.dataSize = ctx.size;
+
+    tool_rc rc = tool_rc_success;
+    if (!ctx.cp_hash_path) {
+        rc = tpm2_nv_definespace(ectx, &ctx.auth_hierarchy.object,
+                &ctx.nv_auth, &public_info, NULL);
+        if (rc != tool_rc_success) {
+            LOG_ERR("Failed to create NV index 0x%x.", ctx.nv_index);
+            return rc;
+        }
+        tpm2_tool_output("nv-index: 0x%x\n", ctx.nv_index);
+        goto nvdefine_out;
+    }
+
+    TPM2B_DIGEST cp_hash = { .size = 0 };
+    rc = tpm2_nv_definespace(ectx, &ctx.auth_hierarchy.object,
+        &ctx.nv_auth, &public_info, &cp_hash);;
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+    if (!result) {
+        rc = tool_rc_general_error;
+    }
+
+nvdefine_out:
+    return rc;
+}
+
+static bool on_option(char key, char *value) {
+
+    bool result;
+
+    switch (key) {
+    case 'C':
+        ctx.auth_hierarchy.ctx_path = value;
+        break;
+    case 'P':
+        ctx.auth_hierarchy.auth_str = value;
+        break;
+    case 's':
+        ctx.size_set = true;
+        result = tpm2_util_string_to_uint16(value, &ctx.size);
+        if (!result) {
+            LOG_ERR("Could not convert size to number, got: \"%s\"", value);
             return false;
         }
-    } 
-
-    public_info.t.nvPublic.dataSize = ctx->size;
-
-    TPM2B_AUTH nvAuth;
-    result = password_tpm2_util_to_auth(&ctx->indexPasswd, ctx->hexPasswd,
-            "index password", &nvAuth);
-    if (!result) {
-        return false;
+        break;
+    case 'a':
+        result = tpm2_util_string_to_uint32(value, &ctx.nv_attribute);
+        if (!result) {
+            result = tpm2_attr_util_nv_strtoattr(value, &ctx.nv_attribute);
+            if (!result) {
+                LOG_ERR(
+                        "Could not convert NV attribute to number or keyword, got: \"%s\"",
+                        value);
+                return false;
+            }
+        }
+        break;
+    case 'p':
+        ctx.index_auth_str = value;
+        break;
+    case 'L':
+        ctx.policy_file = value;
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
     }
-
-    TPM_RC rval = Tss2_Sys_NV_DefineSpace(ctx->sapi_context, ctx->authHandle,
-            &sessions_data, &nvAuth, &public_info, &sessions_data_out);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("Failed to define NV area at index 0x%x (%d).Error:0x%x",
-                ctx->nvIndex, ctx->nvIndex, rval);
-        return false;
-    }
-
-    LOG_INFO("Success to define NV area at index 0x%x (%d).", ctx->nvIndex, ctx->nvIndex);
 
     return true;
 }
 
-#define MAX_ARG_CNT ((int)(2 * (sizeof(long_options)/sizeof(long_options[0]) - 1)))
+static bool on_arg(int argc, char **argv) {
 
-static bool init(int argc, char* argv[], tpm_nvdefine_ctx *ctx) {
+    return on_arg_nv_index(argc, argv, &ctx.nv_index);
+}
 
-    struct option long_options[] = {
-        { "index",                  required_argument,  NULL,   'x' },
-        { "authHandle",             required_argument,  NULL,   'a' },
-        { "size",                   required_argument,  NULL,   's' },
-        { "attribute",              required_argument,  NULL,   't' },
-        { "handlePasswd",           required_argument,  NULL,   'P' },
-        { "indexPasswd",            required_argument,  NULL,   'I' },
-        { "passwdInHex",            no_argument,        NULL,   'X' },
-        { "policy-file",            required_argument,  NULL,   'L' },
-        { "enforce-read-policy",    no_argument,        NULL,   'r' },
-        { "enforce-write-policy",   no_argument,        NULL,   'w' },
-        { "enforce-delete-policy",  no_argument,        NULL,   'd' },
-        { "input-session-handle",   required_argument,  NULL,   'S' },
-        { NULL,                     no_argument,        NULL,    0  },
+static bool tpm2_tool_onstart(tpm2_options **opts) {
+
+    const struct option topts[] = {
+        { "hierarchy",      required_argument, NULL, 'C' },
+        { "size",           required_argument, NULL, 's' },
+        { "attributes",     required_argument, NULL, 'a' },
+        { "hierarchy-auth", required_argument, NULL, 'P' },
+        { "index-auth",     required_argument, NULL, 'p' },
+        { "policy",         required_argument, NULL, 'L' },
+        { "cphash",         required_argument, NULL,  0  },
     };
 
-    if (argc <= 1 || argc > MAX_ARG_CNT) {
-        showArgMismatch(argv[0]);
-        return false;
+    *opts = tpm2_options_new("C:s:a:P:p:L:", ARRAY_LEN(topts), topts, on_option,
+            on_arg, 0);
+
+    return *opts != NULL;
+}
+
+static void handle_default_attributes(void) {
+
+    /* attributes set no need for defaults */
+    if (ctx.nv_attribute) {
+        return;
     }
 
-    int opt;
-    bool result;
-    while ((opt = getopt_long(argc, argv, "x:a:s:t:P:I:rwdL:S:X", long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'x':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->nvIndex);
-            if (!result) {
-                LOG_ERR("Could not convert NV index to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
+    ESYS_TR h = ctx.auth_hierarchy.object.tr_handle;
 
-            if (ctx->nvIndex == 0) {
-                LOG_ERR("NV Index cannot be 0");
-                return false;
-            }
-            break;
-        case 'a':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->authHandle);
-            if (!result) {
-                LOG_ERR("Could not convert auth handle to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
+    if (h == ESYS_TR_RH_OWNER) {
+        ctx.nv_attribute |= TPMA_NV_OWNERWRITE | TPMA_NV_OWNERREAD;
+    } else if (h == ESYS_TR_RH_PLATFORM) {
+        ctx.nv_attribute |= TPMA_NV_PPWRITE | TPMA_NV_PPREAD;
+    } /* else it's an nv index for auth */
 
-            if (ctx->authHandle == 0) {
-                LOG_ERR("Auth handle cannot be 0");
-                return false;
-            }
+    /* if it has a policy file, set policy read and write vs auth read and write */
+    if (ctx.policy_file) {
+        ctx.nv_attribute |= TPMA_NV_POLICYWRITE | TPMA_NV_POLICYREAD;
+    } else {
+        ctx.nv_attribute |= TPMA_NV_AUTHWRITE | TPMA_NV_AUTHREAD;
+    }
+}
+
+static void get_max_nv_index_size(ESYS_CONTEXT *ectx, UINT16 *size) {
+
+    *size = 0;
+
+    /* get the max NV index for the TPM */
+    TPMS_CAPABILITY_DATA *capabilities = NULL;
+    tool_rc tmp_rc = tpm2_getcap(ectx, TPM2_CAP_TPM_PROPERTIES, TPM2_PT_FIXED,
+            TPM2_MAX_TPM_PROPERTIES, NULL, &capabilities);
+    if (tmp_rc != tool_rc_success) {
+        *size = TPM2_MAX_NV_BUFFER_SIZE;
+        LOG_ERR("Could not get fixed TPM properties");
+        return;
+    }
+
+    TPMS_TAGGED_PROPERTY *properties = capabilities->data.tpmProperties.tpmProperty;
+    UINT32 count = capabilities->data.tpmProperties.count;
+
+    if (!count) {
+        *size = TPM2_MAX_NV_BUFFER_SIZE;
+        LOG_ERR("Could not get maximum NV index size");
+        goto out;
+    }
+
+    UINT32 i;
+    for (i=0; i < count; i++) {
+        if (properties[i].property == TPM2_PT_NV_INDEX_MAX) {
+            *size = properties[i].value;
             break;
-        case 'P':
-            result = password_tpm2_util_copy_password(optarg, "handle password",
-                    &ctx->handlePasswd);
-            if (!result) {
-                return false;
-            }
-            break;
-        case 's':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->size);
-            if (!result) {
-                LOG_ERR("Could not convert size to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            break;
-        case 't':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->nvAttribute);
-            if (!result) {
-                LOG_ERR("Could not convert NV attribute to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            break;
-        case 'I':
-            result = password_tpm2_util_copy_password(optarg, "index password",
-                    &ctx->indexPasswd);
-            if (!result) {
-                return false;
-            }
-            break;
-        case 'X':
-            ctx->hexPasswd = true;
-            break;
-        case 'L':
-            ctx->policy_file = optarg;
-            ctx->policy_file_flag = true;
-            break;
-        case 'r':
-            ctx->enforce_read_policy = true;
-            break;
-        case 'w':
-            ctx->enforce_write_policy = true;
-            break;
-        case 'd':
-            ctx->enforce_delete_policy = true;
-            break;
-        case 'S':
-             if (!tpm2_util_string_to_uint32(optarg, &ctx->auth_session_handle)) {
-                 LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                         optarg);
-                 return false;
-             }
-             ctx->is_auth_session = true;
-             break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
         }
     }
 
-    return true;
+    if (*size == 0) {
+        *size = TPM2_MAX_NV_BUFFER_SIZE;
+        LOG_ERR("Could not find max NV indices in capabilities");
+    }
+
+out:
+    free(capabilities);
+
+    return;
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-            TSS2_SYS_CONTEXT *sapi_context) {
+static tool_rc handle_no_index_specified(ESYS_CONTEXT *ectx, TPM2_NV_INDEX *chosen) {
 
-        (void)opts;
-        (void)envp;
+    tool_rc rc = tool_rc_general_error;
 
-        tpm_nvdefine_ctx ctx = {
-            .nvIndex = 0,
-            .authHandle = TPM_RH_PLATFORM,
-            .size = 0,
-            .nvAttribute = 0,
-            .handlePasswd = TPM2B_EMPTY_INIT,
-            .indexPasswd = TPM2B_EMPTY_INIT,
-            .hexPasswd = false,
-            .sapi_context = sapi_context,
-            .enforce_read_policy = false,
-            .enforce_write_policy = false,
-            .enforce_delete_policy = false,
-            .policy_file_flag = false,
-            .is_auth_session = false
-        };
+    TPM2_NV_INDEX max = 0;
 
-        bool result = init(argc, argv, &ctx);
-        if (!result) {
-            return 1;
+    /* get the max NV index for the TPM */
+    TPMS_CAPABILITY_DATA *capabilities = NULL;
+    tool_rc tmp_rc = tpm2_getcap(ectx, TPM2_CAP_TPM_PROPERTIES, TPM2_PT_FIXED,
+            TPM2_MAX_TPM_PROPERTIES, NULL, &capabilities);
+    if (tmp_rc != tool_rc_success) {
+        return tmp_rc;
+    }
+
+    TPMS_TAGGED_PROPERTY *properties = capabilities->data.tpmProperties.tpmProperty;
+    UINT32 count = capabilities->data.tpmProperties.count;
+
+    if (!count) {
+        LOG_ERR("Could not get maximum NV index, try specifying an NV index");
+        goto out;
+    }
+
+    UINT32 i;
+    for (i=0; i < count; i++) {
+        if (properties[i].property == TPM2_PT_NV_INDEX_MAX) {
+            max = TPM2_HR_NV_INDEX | properties[i].value;
+        }
+    }
+
+    if (!max) {
+        LOG_ERR("Could not find max NV indices in capabilities");
+        goto out;
+    }
+
+    /* done getting max NV index */
+    free(capabilities);
+    capabilities = NULL;
+
+    /* now find what NV indexes are in use */
+    tmp_rc = tpm2_getcap(ectx, TPM2_CAP_HANDLES, tpm2_util_hton_32(TPM2_HT_NV_INDEX),
+            TPM2_PT_NV_INDEX_MAX, NULL, &capabilities);
+    if (tmp_rc != tool_rc_success) {
+        goto out;
+    }
+
+    /*
+     * now starting at the first valid index, find one not in use
+     * The TPM interface makes no guarantee that handles are returned in order
+     * so we have to do a linear search every attempt for a free handle :-(
+     */
+    bool found = false;
+    TPM2_NV_INDEX choose;
+    for (choose = TPM2_HR_NV_INDEX; choose < max; choose++) {
+
+        bool in_use = false;
+
+        /* take the index to guess and check against everything in use */
+        for (i = 0; i < capabilities->data.handles.count; i++) {
+            TPMI_RH_NV_INDEX index = capabilities->data.handles.handle[i];
+            if (index == choose) {
+                in_use = true;
+                break;
+            }
         }
 
-        return nv_space_define(&ctx) != true;
+        if (!in_use) {
+            /* it's not in use, use the current value of choose */
+            found = true;
+            break;
+        }
+
+    }
+
+    if (!found) {
+        LOG_ERR("No free NV index found");
+        goto out;
+    }
+
+    *chosen = choose;
+
+    rc = tool_rc_success;
+
+out:
+    free(capabilities);
+
+    return rc;
 }
+
+static tool_rc validate_size(ESYS_CONTEXT *ectx) {
+
+    switch ((ctx.nv_attribute & TPMA_NV_TPM2_NT_MASK) >> TPMA_NV_TPM2_NT_SHIFT) {
+        case TPM2_NT_ORDINARY:
+            if (!ctx.size_set) {
+                get_max_nv_index_size(ectx, &ctx.size);
+            }
+            break;
+        case TPM2_NT_COUNTER:
+        case TPM2_NT_BITS:
+        case TPM2_NT_PIN_FAIL:
+        case TPM2_NT_PIN_PASS:
+            if (!ctx.size_set) {
+                ctx.size = 8;
+            } else if (ctx.size != 8) {
+                LOG_ERR("Size is invalid for an NV index type,"
+                        " it must be size of 8");
+                return tool_rc_general_error;
+            }
+            break;
+        case TPM2_NT_EXTEND:
+            if (!ctx.size_set) {
+                // Currently the NV define doesn't allow changing name algorithm, so this OK
+                ctx.size = TPM2_SHA256_DIGEST_SIZE;
+            } else if (ctx.size != TPM2_SHA256_DIGEST_SIZE) {
+                LOG_ERR("Size is invalid for an NV index type: \"extend\","
+                        " it must match the name hash algorithm size of 32");
+                return tool_rc_general_error;
+            }
+            break;
+    }
+
+    return tool_rc_success;
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.auth_hierarchy.ctx_path,
+            ctx.auth_hierarchy.auth_str, &ctx.auth_hierarchy.object, false,
+            TPM2_HANDLE_FLAGS_O | TPM2_HANDLE_FLAGS_P);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid authorization");
+        return rc;
+    }
+
+    tpm2_session *tmp;
+    rc = tpm2_auth_util_from_optarg(NULL, ctx.index_auth_str, &tmp, true);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid index authorization");
+        return rc;
+    }
+
+    const TPM2B_AUTH *auth = tpm2_session_get_auth_value(tmp);
+    ctx.nv_auth = *auth;
+
+    tpm2_session_close(&tmp);
+
+    handle_default_attributes();
+
+    if (!ctx.nv_index) {
+        rc = handle_no_index_specified(ectx, &ctx.nv_index);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+    }
+
+    rc = validate_size(ectx);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    return nv_space_define(ectx);
+}
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+    if (!ctx.cp_hash_path) {
+        return tpm2_session_close(&ctx.auth_hierarchy.object.session);
+    }
+    return tool_rc_success;
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("nvdefine", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

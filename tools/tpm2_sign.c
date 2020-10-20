@@ -1,383 +1,330 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
-#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
-
-#include <getopt.h>
-#include <sapi/tpm20.h>
 
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
-#include "tpm_hash.h"
+#include "tpm2.h"
+#include "tpm2_tool.h"
+#include "tpm2_alg_util.h"
+#include "tpm2_convert.h"
+#include "tpm2_hash.h"
+#include "tpm2_options.h"
 
 typedef struct tpm_sign_ctx tpm_sign_ctx;
 struct tpm_sign_ctx {
     TPMT_TK_HASHCHECK validation;
-    TPMS_AUTH_COMMAND sessionData;
-    TPMI_DH_OBJECT keyHandle;
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } signing_key;
+
     TPMI_ALG_HASH halg;
-    char *outFilePath;
+    TPMI_ALG_SIG_SCHEME sig_scheme;
+    TPMT_SIG_SCHEME in_scheme;
+    TPM2B_DIGEST *digest;
+    char *output_path;
     BYTE *msg;
     UINT16 length;
-    TSS2_SYS_CONTEXT *sapi_context;
+    char *input_file;
+    tpm2_convert_sig_fmt sig_format;
+
+    struct {
+        UINT8 d :1;
+        UINT8 t :1;
+        UINT8 o :1;
+    } flags;
+
+    char *cp_hash_path;
+    char *commit_index;
 };
 
-static bool get_key_type(TSS2_SYS_CONTEXT *sapi_context, TPMI_DH_OBJECT objectHandle,
-        TPMI_ALG_PUBLIC *type) {
+static tpm_sign_ctx ctx = {
+        .halg = TPM2_ALG_NULL,
+        .sig_scheme = TPM2_ALG_NULL
+};
 
-    TPMS_AUTH_RESPONSE session_data_out;
+static tool_rc sign_and_save(ESYS_CONTEXT *ectx) {
 
-    TPMS_AUTH_RESPONSE *session_data_out_array[1] = {
-            &session_data_out
-    };
+    TPMT_SIGNATURE *signature;
+    bool result;
 
-    TSS2_SYS_RSP_AUTHS sessions_data_out = {
-            1,
-            &session_data_out_array[0]
-    };
+    if (ctx.cp_hash_path) {
+        TPM2B_DIGEST cp_hash = { .size = 0 };
+        tool_rc rc = tpm2_sign(ectx, &ctx.signing_key.object, ctx.digest,
+            &ctx.in_scheme, &ctx.validation, &signature, &cp_hash);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
 
-    TPM2B_PUBLIC out_public = TPM2B_EMPTY_INIT;
+        bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+        if (!result) {
+            rc = tool_rc_general_error;
+        }
 
-    TPM2B_NAME name = TPM2B_TYPE_INIT(TPM2B_NAME, name);
-
-    TPM2B_NAME qaulified_name = TPM2B_TYPE_INIT(TPM2B_NAME, name);
-
-    TPM_RC rval = Tss2_Sys_ReadPublic(sapi_context, objectHandle, 0, &out_public, &name,
-            &qaulified_name, &sessions_data_out);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("Sys_ReadPublic failed, error code: 0x%x", rval);
-        return false;
+        return rc;
     }
-    *type = out_public.t.publicArea.type;
-    return true;
+
+    tool_rc rc = tpm2_sign(ectx, &ctx.signing_key.object, ctx.digest,
+            &ctx.in_scheme, &ctx.validation, &signature, NULL);
+    if (rc != tool_rc_success) {
+        goto out;
+    }
+
+    result = tpm2_convert_sig_save(signature, ctx.sig_format, ctx.output_path);
+    if (!result) {
+        rc = tool_rc_general_error;
+        goto out;
+    }
+
+    rc = tool_rc_success;
+
+out:
+    free(signature);
+
+    return rc;
 }
 
-static bool set_scheme(TSS2_SYS_CONTEXT *sapi_context, TPMI_DH_OBJECT keyHandle,
-        TPMI_ALG_HASH halg, TPMT_SIG_SCHEME *inScheme) {
+static tool_rc init(ESYS_CONTEXT *ectx) {
 
-    TPM_ALG_ID type;
-    bool result = get_key_type(sapi_context, keyHandle, &type);
-    if (!result) {
-        return false;
+    /*
+     * Set signature scheme for key type, or validate chosen scheme is
+     * allowed for key type.
+     */
+    tool_rc rc = tpm2_alg_util_get_signature_scheme(ectx,
+            ctx.signing_key.object.tr_handle, &ctx.halg, ctx.sig_scheme,
+            &ctx.in_scheme);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid signature scheme for key type!");
+        return rc;
     }
 
-    switch (type) {
-    case TPM_ALG_RSA :
-        inScheme->scheme = TPM_ALG_RSASSA;
-        inScheme->details.rsassa.hashAlg = halg;
-        break;
-    case TPM_ALG_KEYEDHASH :
-        inScheme->scheme = TPM_ALG_HMAC;
-        inScheme->details.hmac.hashAlg = halg;
-        break;
-    case TPM_ALG_ECC :
-        inScheme->scheme = TPM_ALG_ECDSA;
-        inScheme->details.ecdsa.hashAlg = halg;
-        break;
-    case TPM_ALG_SYMCIPHER :
-    default:
-        LOG_ERR("Unknown key type, got: 0x%x", type);
-        return false;
+    if (ctx.in_scheme.scheme != TPM2_ALG_ECDAA && ctx.commit_index) {
+        LOG_ERR("Commit counter is only applicable in an ECDAA scheme.");
+        return tool_rc_option_error;
     }
 
-    return true;
-}
-
-static bool sign_and_save(tpm_sign_ctx *ctx) {
-
-    TPM2B_DIGEST digest = TPM2B_TYPE_INIT(TPM2B_DIGEST, buffer);
-
-    TPMT_SIG_SCHEME in_scheme;
-    TPMT_SIGNATURE signature;
-
-    TSS2_SYS_CMD_AUTHS sessions_data;
-    TPMS_AUTH_RESPONSE session_data_out;
-    TSS2_SYS_RSP_AUTHS sessions_data_out;
-    TPMS_AUTH_COMMAND *session_data_array[1];
-    TPMS_AUTH_RESPONSE *session_data_out_array[1];
-
-    session_data_array[0] = &ctx->sessionData;
-    sessions_data.cmdAuths = &session_data_array[0];
-    session_data_out_array[0] = &session_data_out;
-    sessions_data_out.rspAuths = &session_data_out_array[0];
-    sessions_data_out.rspAuthsCount = 1;
-    sessions_data.cmdAuthsCount = 1;
-
-    int rc = tpm_hash_compute_data(ctx->sapi_context, ctx->msg, ctx->length,
-            ctx->halg, &digest);
-    if (rc) {
-        LOG_ERR("Compute message hash failed!");
-        return false;
-    }
-
-//    printf("\ndigest(hex type):\n ");
-//    UINT16 i;
-//    for (i = 0; i < digest.t.size; i++)
-//        printf("%02x ", digest.t.buffer[i]);
-//    printf("\n");
-
-    bool result = set_scheme(ctx->sapi_context, ctx->keyHandle, ctx->halg, &in_scheme);
-    if (!result) {
-        return false;
-    }
-
-    TPM_RC rval = Tss2_Sys_Sign(ctx->sapi_context, ctx->keyHandle,
-            &sessions_data, &digest, &in_scheme, &ctx->validation, &signature,
-            &sessions_data_out);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("Sys_Sign failed, error code: 0x%x", rval);
-        return false;
-    }
-
-    /* TODO fix serialization */
-    return files_save_bytes_to_file(ctx->outFilePath, (UINT8 *) &signature,
-            sizeof(signature));
-}
-
-static bool init(int argc, char *argv[], tpm_sign_ctx *ctx) {
-
-    static const char *optstring = "k:P:g:m:t:s:c:S:X";
-    static const struct option long_options[] = {
-      {"keyHandle",1,NULL,'k'},
-      {"pwdk",1,NULL,'P'},
-      {"halg",1,NULL,'g'},
-      {"msg",1,NULL,'m'},
-      {"sig",1,NULL,'s'},
-      {"ticket",1,NULL,'t'},
-      {"keyContext",1,NULL,'c'},
-      {"passwdInHex",0,NULL,'X'},
-      {"input-session-handle",1,NULL, 'S' },
-      {0,0,0,0}
-    };
-
-    if(argc == 1) {
-        showArgMismatch(argv[0]);
-        return false;
-    }
-
-    union {
-        struct {
-            UINT8 k : 1;
-            UINT8 P : 1;
-            UINT8 g : 1;
-            UINT8 m : 1;
-            UINT8 t : 1;
-            UINT8 s : 1;
-            UINT8 c : 1;
-            UINT8 unused : 1;
-        };
-        UINT8 all;
-    } flags = { .all = 0 };
-
-    int opt;
-    bool hexPasswd = false;
-    char *contextKeyFile = NULL;
-    char *inMsgFileName = NULL;
-    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL)) != -1) {
-        switch (opt) {
-        case 'k': {
-            bool result = tpm2_util_string_to_uint32(optarg, &ctx->keyHandle);
-            if (!result) {
-                LOG_ERR("Could not format key handle to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            flags.k = 1;
-        }
-            break;
-        case 'P': {
-            bool result = password_tpm2_util_copy_password(optarg, "key",
-                    &ctx->sessionData.hmac);
-            if (!result) {
-                return false;
-            }
-            flags.P = 1;
-        }
-            break;
-        case 'g': {
-            bool result = tpm2_util_string_to_uint16(optarg, &ctx->halg);
-            if (!result) {
-                LOG_ERR("Could not format algorithm to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            flags.g = 1;
-        }
-            break;
-        case 'm':
-            inMsgFileName = optarg;
-            flags.m = 1;
-            break;
-        case 't': {
-            UINT16 size = sizeof(ctx->validation);
-            bool result = files_load_bytes_from_file(optarg, (UINT8 *) &ctx->validation,
-                    &size);
-            if (!result) {
-                return false;
-            }
-            flags.t = 1;
-        }
-            break;
-        case 's': {
-            bool result = files_does_file_exist(optarg);
-            if (result) {
-                return false;
-            }
-            ctx->outFilePath = optarg;
-            flags.s = 1;
-        }
-            break;
-        case 'c':
-            contextKeyFile = optarg;
-            flags.c = 1;
-            break;
-        case 'X':
-            hexPasswd = true;
-            break;
-        case 'S':
-            if (!tpm2_util_string_to_uint32(optarg, &ctx->sessionData.sessionHandle)) {
-                LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
+    if (ctx.in_scheme.scheme == TPM2_ALG_ECDAA && ctx.commit_index) {
+        bool result = tpm2_util_string_to_uint16(ctx.commit_index,
+            &ctx.in_scheme.details.ecdaa.count);
+        if (!result) {
+            return tool_rc_general_error;
         }
     }
 
-    if (!((flags.k || flags.c) && flags.g && flags.m && flags.s)) {
-        LOG_ERR("Expected options (k or c) and g and m and s");
-        return false;
+    if (ctx.in_scheme.scheme == TPM2_ALG_ECDAA &&
+    ctx.sig_format != signature_format_tss) {
+        LOG_ERR("Only TSS signature format is possible with ECDAA scheme");
+        return tool_rc_option_error;
     }
 
-    if (!flags.t) {
-        ctx->validation.tag = TPM_ST_HASHCHECK;
-        ctx->validation.hierarchy = TPM_RH_NULL;
+    if (ctx.cp_hash_path && ctx.output_path) {
+        LOG_ERR("Cannot output signature when calculating cpHash");
+        return tool_rc_option_error;
     }
 
-    bool result = password_tpm2_util_to_auth(&ctx->sessionData.hmac, hexPasswd,
-            "key", &ctx->sessionData.hmac);
-    if (!result) {
-        return false;
+    if (!ctx.signing_key.ctx_path) {
+        LOG_ERR("Expected option c");
+        return tool_rc_option_error;
+    }
+
+    if (!ctx.flags.o && !ctx.cp_hash_path) {
+        LOG_ERR("Expected option o");
+        return tool_rc_option_error;
+    }
+
+    if (!ctx.flags.d && ctx.flags.t) {
+        LOG_WARN("Ignoring the specified validation ticket since no TPM "
+                 "calculated digest specified.");
     }
 
     /*
-     * load tpm context from a file if -c is provided
+     * Applicable when input data is not a digest, rather the message to sign.
+     * A digest is calculated first in this case.
      */
-    if (flags.c) {
-        result = file_load_tpm_context_from_file(ctx->sapi_context, &ctx->keyHandle,
-                contextKeyFile);
+    if (!ctx.flags.d) {
+        FILE *input = ctx.input_file ? fopen(ctx.input_file, "rb") : stdin;
+        if (!input) {
+            LOG_ERR("Could not open file \"%s\"", ctx.input_file);
+            return tool_rc_general_error;
+        }
+
+        TPMT_TK_HASHCHECK *temp_validation_ticket;
+        rc = tpm2_hash_file(ectx, ctx.halg, TPM2_RH_OWNER, input, &ctx.digest,
+                &temp_validation_ticket);
+        if (input != stdin) {
+            fclose(input);
+        }
+        if (rc != tool_rc_success) {
+            LOG_ERR("Could not hash input");
+        }
+
+        ctx.validation = *temp_validation_ticket;
+        free(temp_validation_ticket);
+
+        /*
+         * we don't need to perform the digest, just read it
+         */
+        return rc;
+    }
+
+    /*
+     * else process it as a pre-computed digest
+     */
+    ctx.digest = malloc(sizeof(TPM2B_DIGEST));
+    if (!ctx.digest) {
+        LOG_ERR("oom");
+        return tool_rc_general_error;
+    }
+
+    ctx.digest->size = sizeof(ctx.digest->buffer);
+    bool result = files_load_bytes_from_buffer_or_file_or_stdin(NULL,
+            ctx.input_file, &ctx.digest->size, ctx.digest->buffer);
+    if (!result) {
+        return tool_rc_general_error;
+    }
+
+    /*
+     * Applicable to un-restricted signing keys
+     * NOTE: When digests without tickets are specified for restricted keys,
+     * the sign operation will fail.
+     */
+    if (ctx.flags.d && !ctx.flags.t) {
+        ctx.validation.tag = TPM2_ST_HASHCHECK;
+        ctx.validation.hierarchy = TPM2_RH_NULL;
+        memset(&ctx.validation.digest, 0, sizeof(ctx.validation.digest));
+    }
+
+    return tool_rc_success;
+}
+
+static bool on_option(char key, char *value) {
+
+    switch (key) {
+    case 'c':
+        ctx.signing_key.ctx_path = value;
+        break;
+    case 'p':
+        ctx.signing_key.auth_str = value;
+        break;
+    case 'g':
+        ctx.halg = tpm2_alg_util_from_optarg(value, tpm2_alg_util_flags_hash);
+        if (ctx.halg == TPM2_ALG_ERROR) {
+            LOG_ERR("Could not convert to number or lookup algorithm, got: "
+                    "\"%s\"", value);
+            return false;
+        }
+        break;
+    case 's': {
+        ctx.sig_scheme = tpm2_alg_util_from_optarg(value,
+                tpm2_alg_util_flags_sig);
+        if (ctx.sig_scheme == TPM2_ALG_ERROR) {
+            LOG_ERR("Unknown signing scheme, got: \"%s\"", value);
+            return false;
+        }
+    }
+        break;
+    case 'd':
+        ctx.flags.d = 1;
+        break;
+    case 't': {
+        bool result = files_load_validation(value, &ctx.validation);
         if (!result) {
             return false;
         }
+        ctx.flags.t = 1;
     }
+        break;
+    case 'o':
+        ctx.output_path = value;
+        ctx.flags.o = 1;
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
+    case 1:
+        ctx.commit_index = value;
+        break;
+    case 'f':
+        ctx.sig_format = tpm2_convert_sig_fmt_from_optarg(value);
 
-    /*
-     * Process the msg file
-     */
-    long file_size;
-    result = files_get_file_size(inMsgFileName, &file_size);
-    if (!result) {
-        return false;
-    }
-    if (file_size == 0) {
-        LOG_ERR("The message file \"%s\" is empty!", inMsgFileName);
-        return false;
-    }
-
-    if (file_size > 0xffff) {
-        LOG_ERR(
-                "The message file was longer than a 16 bit length, got: %ld, expected less than: %d!",
-                file_size, 0x10000);
-        return false;
-    }
-
-    ctx->msg = (BYTE*) calloc(1, file_size);
-    if (!ctx->msg) {
-        LOG_ERR("oom");
-        return false;
-    }
-
-    ctx->length = file_size;
-    result = files_load_bytes_from_file(inMsgFileName, ctx->msg, &ctx->length);
-    if (!result) {
-        free(ctx->msg);
-        return false;
+        if (ctx.sig_format == signature_format_err) {
+            return false;
+        }
+        /* no default */
     }
 
     return true;
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
+static bool on_args(int argc, char *argv[]) {
 
-    /* opts and envp are unused, avoid compiler warning */
-    (void)opts;
-    (void) envp;
-
-    tpm_sign_ctx ctx = {
-            .msg = NULL,
-            .sessionData = TPMS_AUTH_COMMAND_EMPTY_INIT,
-            .halg = 0,
-            .keyHandle = 0,
-            .validation = TPMT_TK_HASHCHECK_EMPTY_INIT,
-            .sapi_context = sapi_context
-    };
-
-    ctx.sessionData.sessionHandle = TPM_RS_PW;
-
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        return 1;
+    if (argc != 1) {
+        LOG_ERR("Expected one input file, got: %d", argc);
+        return false;
     }
 
-    result = sign_and_save(&ctx);
+    ctx.input_file = argv[0];
 
-    free(ctx.msg);
-
-    return result != true;
+    return true;
 }
+
+static bool tpm2_tool_onstart(tpm2_options **opts) {
+
+    static const struct option topts[] = {
+      { "auth",                 required_argument, NULL, 'p' },
+      { "hash-algorithm",       required_argument, NULL, 'g' },
+      { "scheme",               required_argument, NULL, 's' },
+      { "digest",               no_argument,       NULL, 'd' },
+      { "signature",            required_argument, NULL, 'o' },
+      { "ticket",               required_argument, NULL, 't' },
+      { "key-context",          required_argument, NULL, 'c' },
+      { "format",               required_argument, NULL, 'f' },
+      { "cphash",               required_argument, NULL,  0  },
+      { "commit-index",       required_argument, NULL,  1  },
+    };
+
+    *opts = tpm2_options_new("p:g:dt:o:c:f:s:", ARRAY_LEN(topts), topts,
+            on_option, on_args, 0);
+
+    return *opts != NULL;
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.signing_key.ctx_path,
+            ctx.signing_key.auth_str, &ctx.signing_key.object, false,
+            TPM2_HANDLE_ALL_W_NV);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid key authorization");
+        return rc;
+    }
+
+    rc = init(ectx);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    return sign_and_save(ectx);
+}
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+    return tpm2_session_close(&ctx.signing_key.object.session);
+}
+
+static void tpm2_tool_onexit(void) {
+
+    if (ctx.digest) {
+        free(ctx.digest);
+    }
+    free(ctx.msg);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("sign", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, tpm2_tool_onexit)

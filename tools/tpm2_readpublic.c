@@ -1,184 +1,179 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
-#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-
-#include <getopt.h>
-#include <sapi/tpm20.h>
 
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
+#include "tpm2.h"
+#include "tpm2_convert.h"
+#include "tpm2_tool.h"
 
 typedef struct tpm_readpub_ctx tpm_readpub_ctx;
 struct tpm_readpub_ctx {
-    TPMI_DH_OBJECT objectHandle;
-    char *outFilePath;
-    TSS2_SYS_CONTEXT *sapi_context;
+    struct {
+        UINT8 f :1;
+    } flags;
+    char *output_path;
+    char *out_name_file;
+    char *out_qname_file;
+    tpm2_convert_pubkey_fmt format;
+    tpm2_loaded_object context_object;
+    const char *context_arg;
+    const char *out_tr_file;
 };
 
-#define ARRAY_LEN(x) (sizeof(x)/sizeof(x[0]))
+static tpm_readpub_ctx ctx = {
+    .format = pubkey_format_tss,
+};
 
-static int read_public_and_save(tpm_readpub_ctx *ctx) {
+static tool_rc read_public_and_save(ESYS_CONTEXT *ectx) {
 
-    TPMS_AUTH_RESPONSE session_out_data;
-    TSS2_SYS_RSP_AUTHS sessions_out_data;
-    TPMS_AUTH_RESPONSE *session_out_data_array[1];
+    TPM2B_PUBLIC *public;
+    TPM2B_NAME *name;
+    TPM2B_NAME *qualified_name;
 
-    TPM2B_PUBLIC public = TPM2B_EMPTY_INIT;
+    tool_rc rc = tool_rc_general_error;
 
-    TPM2B_NAME name = TPM2B_TYPE_INIT(TPM2B_NAME, name);
-
-    TPM2B_NAME qualified_name = TPM2B_TYPE_INIT(TPM2B_NAME, name);
-
-    session_out_data_array[0] = &session_out_data;
-    sessions_out_data.rspAuths = &session_out_data_array[0];
-    sessions_out_data.rspAuthsCount = ARRAY_LEN(session_out_data_array);
-
-    TPM_RC rval = Tss2_Sys_ReadPublic(ctx->sapi_context, ctx->objectHandle, 0,
-            &public, &name, &qualified_name, &sessions_out_data);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("TPM2_ReadPublic error: rval = 0x%0x", rval);
-        return false;
+    tool_rc tmp_rc = tpm2_readpublic(ectx, ctx.context_object.tr_handle,
+            &public, &name, &qualified_name);
+    if (tmp_rc != tool_rc_success) {
+        return tmp_rc;
     }
 
-    printf("\nTPM2_ReadPublic OutPut: \n");
-    printf("name: \n");
+    tpm2_tool_output("name: ");
     UINT16 i;
-    for (i = 0; i < name.t.size; i++)
-        printf("%02x ", name.t.name[i]);
-    printf("\n");
+    for (i = 0; i < name->size; i++) {
+        tpm2_tool_output("%02x", name->name[i]);
+    }
+    tpm2_tool_output("\n");
 
-    printf("qualified_name: \n");
-    for (i = 0; i < qualified_name.t.size; i++)
-        printf("%02x ", qualified_name.t.name[i]);
-    printf("\n");
+    bool ret = true;
+    if (ctx.out_name_file) {
+        ret = files_save_bytes_to_file(ctx.out_name_file, name->name,
+                name->size);
+        if (!ret) {
+            LOG_ERR("Can not save object name file.");
+            goto out;
+        }
+    }
 
-    /* TODO fix serialization */
-    return files_save_bytes_to_file(ctx->outFilePath, (UINT8 *) &public,
-            sizeof(public));
+    tpm2_tool_output("qualified name: ");
+    for (i = 0; i < qualified_name->size; i++) {
+        tpm2_tool_output("%02x", qualified_name->name[i]);
+    }
+    tpm2_tool_output("\n");
+
+    tpm2_util_public_to_yaml(public, NULL);
+
+    ret = ctx.output_path ?
+            tpm2_convert_pubkey_save(public, ctx.format, ctx.output_path) :
+            true;
+    if (!ret) {
+        goto out;
+    }
+
+    if (ctx.out_qname_file) {
+        ret = files_save_bytes_to_file(ctx.out_qname_file, qualified_name->name,
+                qualified_name->size);
+        if (!ret) {
+            goto out;
+        }
+    }
+
+    if (ctx.out_tr_file) {
+        rc = files_save_ESYS_TR(ectx, ctx.context_object.tr_handle,
+                ctx.out_tr_file);
+    } else {
+        rc = tool_rc_success;
+    }
+
+out:
+    free(public);
+    free(name);
+    free(qualified_name);
+
+    return rc;
 }
 
-static bool init(int argc, char *argv[], tpm_readpub_ctx * ctx) {
+static bool on_option(char key, char *value) {
 
-    const char *short_options = "H:o:c:";
-    static struct option long_options[] = {
-        {"object",        required_argument, NULL,'H'},
-        {"opu",           required_argument, NULL,'o'},
-        {"contextObject", required_argument, NULL,'c'},
-        {NULL,            no_argument,       NULL, '\0'}
-    };
-
-    union {
-        struct {
-            UINT8 H      : 1;
-            UINT8 o      : 1;
-            UINT8 c      : 1;
-            UINT8 unused : 5;
-        };
-        UINT8 all;
-    } flags = { .all = 0 };
-
-    if (argc == 1) {
-        showArgMismatch(argv[0]);
-        return 0;
-    }
-
-    int opt = -1;
-    bool result;
-    char *context_file = NULL;
-    while ((opt = getopt_long(argc, argv, short_options, long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'H':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->objectHandle);
-            if (!result) {
-                return false;
-            }
-            flags.H = 1;
-            break;
-        case 'o':
-            result = files_does_file_exist(optarg);
-            if (result) {
-                return false;
-            }
-            ctx->outFilePath = optarg;
-            flags.o = 1;
-            break;
-        case 'c':
-            context_file = optarg;
-            flags.c = 1;
-            break;
-        }
-    };
-
-    if (!((flags.H || flags.c) && flags.o)) {
-        showArgMismatch(argv[0]);
-        return false;
-    }
-
-    if (flags.c) {
-        result = file_load_tpm_context_from_file(ctx->sapi_context, &ctx->objectHandle,
-                context_file);
-        if (!result) {
+    switch (key) {
+    case 'c':
+        ctx.context_arg = value;
+        break;
+    case 'o':
+        ctx.output_path = value;
+        break;
+    case 'f':
+        ctx.format = tpm2_convert_pubkey_fmt_from_optarg(value);
+        if (ctx.format == pubkey_format_err) {
             return false;
         }
+        ctx.flags.f = 1;
+        break;
+    case 'n':
+        ctx.out_name_file = value;
+        break;
+    case 't':
+        ctx.out_tr_file = value;
+        break;
+    case 'q':
+        ctx.out_qname_file = value;
+        break;
     }
 
     return true;
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
+static bool tpm2_tool_onstart(tpm2_options **opts) {
 
-    (void)opts;
-    (void)envp;
-
-    tpm_readpub_ctx ctx = {
-            .objectHandle = 0,
-            .outFilePath = NULL,
-            .sapi_context = sapi_context
+    static const struct option topts[] = {
+        { "output",            required_argument, NULL, 'o' },
+        { "object-context",    required_argument, NULL, 'c' },
+        { "format",            required_argument, NULL, 'f' },
+        { "name",              required_argument, NULL, 'n' },
+        { "serialized-handle", required_argument, NULL, 't' },
+        { "qualified-name",    required_argument, NULL, 'q' }
     };
 
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        return 1;
+    *opts = tpm2_options_new("o:c:f:n:t:q:", ARRAY_LEN(topts), topts, on_option,
+            NULL, 0);
+
+    return *opts != NULL;
+}
+
+static tool_rc init(ESYS_CONTEXT *context) {
+
+    tool_rc rc = tpm2_util_object_load(context, ctx.context_arg,
+            &ctx.context_object, TPM2_HANDLE_ALL_W_NV);
+    if (rc != tool_rc_success) {
+        return rc;
     }
 
-    return read_public_and_save(&ctx) != true;
+    bool is_persistent = ctx.context_object.handle
+            && ((ctx.context_object.handle >> TPM2_HR_SHIFT)
+                    == TPM2_HT_PERSISTENT);
+    if (ctx.out_tr_file && !is_persistent) {
+        LOG_ERR("Can only output a serialized handle for persistent object "
+                "handles");
+        return tool_rc_general_error;
+    }
+
+    return tool_rc_success;
 }
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *context, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    tool_rc rc = init(context);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    return read_public_and_save(context);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("readpublic", tpm2_tool_onstart, tpm2_tool_onrun, NULL, NULL)

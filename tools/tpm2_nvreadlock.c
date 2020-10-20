@@ -1,212 +1,109 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// Copyright (c) 2016, Atom Software Studios
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
-
-#include <stdbool.h>
-
+/* SPDX-License-Identifier: BSD-3-Clause */
 #include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <getopt.h>
 
-#include <sapi/tpm20.h>
-
+#include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
+#include "tpm2.h"
+#include "tpm2_tool.h"
+#include "tpm2_nv_util.h"
+#include "tpm2_options.h"
 
 typedef struct tpm_nvreadlock_ctx tpm_nvreadlock_ctx;
 struct tpm_nvreadlock_ctx {
-    UINT32 nv_index;
-    UINT32 auth_handle;
-    UINT32 size_to_read;
-    UINT32 offset;
-    TPM2B_AUTH handle_passwd;
-    bool is_hex_passwd;
-    TSS2_SYS_CONTEXT *sapi_context;
-    bool is_auth_session;
-    TPMI_SH_AUTH_SESSION auth_session_handle;
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } auth_hierarchy;
+
+    TPM2_HANDLE nv_index;
+
+    char *cp_hash_path;
 };
 
-static bool nv_readlock(tpm_nvreadlock_ctx *ctx) {
+static tpm_nvreadlock_ctx ctx;
 
-    TPMS_AUTH_COMMAND session_data = {
-        .sessionHandle = TPM_RS_PW,
-        .nonce = TPM2B_EMPTY_INIT,
-        .hmac = TPM2B_EMPTY_INIT,
-        .sessionAttributes = SESSION_ATTRIBUTES_INIT(0),
-    };
-
-    if (ctx->is_auth_session) {
-        session_data.sessionHandle = ctx->auth_session_handle;
+static bool on_arg(int argc, char **argv) {
+    /* If the user doesn't specify an authorization hierarchy use the index
+     * passed to -x/--index for the authorization index.
+     */
+    if (!ctx.auth_hierarchy.ctx_path) {
+        ctx.auth_hierarchy.ctx_path = argv[0];
     }
+    return on_arg_nv_index(argc, argv, &ctx.nv_index);
+}
 
-    TPMS_AUTH_RESPONSE session_data_out;
-    TSS2_SYS_CMD_AUTHS sessions_data;
-    TSS2_SYS_RSP_AUTHS sessions_data_out;
+static bool on_option(char key, char *value) {
 
-    TPMS_AUTH_COMMAND *session_data_array[1];
-    TPMS_AUTH_RESPONSE *sessionDataOutArray[1];
+    switch (key) {
 
-    session_data_array[0] = &session_data;
-    sessionDataOutArray[0] = &session_data_out;
-
-    sessions_data_out.rspAuths = &sessionDataOutArray[0];
-    sessions_data.cmdAuths = &session_data_array[0];
-
-    sessions_data_out.rspAuthsCount = 1;
-    sessions_data.cmdAuthsCount = 1;
-
-    bool result = password_tpm2_util_to_auth(&ctx->handle_passwd, ctx->is_hex_passwd,
-            "handle password", &session_data.hmac);
-    if (!result) {
-        return false;
-    }
-
-    TPM_RC rval = Tss2_Sys_NV_ReadLock(ctx->sapi_context, ctx->auth_handle, ctx->nv_index,
-            &sessions_data, &sessions_data_out);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("Failed to lock NVRAM area at index 0x%x (%d).Error:0x%x",
-                ctx->nv_index, ctx->nv_index, rval);
-        return false;
+    case 'C':
+        ctx.auth_hierarchy.ctx_path = value;
+        break;
+    case 'P':
+        ctx.auth_hierarchy.auth_str = value;
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
     }
 
     return true;
 }
 
-#define ARG_CNT(optional) ((int)(2 * (sizeof(long_options)/sizeof(long_options[0]) - optional - 1)))
+static bool tpm2_tool_onstart(tpm2_options **opts) {
 
-static bool init(int argc, char *argv[], tpm_nvreadlock_ctx *ctx) {
-
-    struct option long_options[] = {
-        { "index"       , required_argument, NULL, 'x' },
-        { "authHandle"  , required_argument, NULL, 'a' },
-        { "handlePasswd", required_argument, NULL, 'P' },
-        { "passwdInHex" , no_argument,       NULL, 'X' },
-        { "input-session-handle",1,          NULL, 'S' },
-        { NULL          , no_argument,       NULL, 0   },
+    const struct option topts[] = {
+        { "hierarchy", required_argument, NULL, 'C' },
+        { "auth",      required_argument, NULL, 'P' },
+        { "cphash",    required_argument, NULL,  0  },
     };
 
-    /* subtract 1 from argc to disregard argv[0] */
-    if ((argc - 1) < ARG_CNT(1) || (argc - 1) > ARG_CNT(0)) {
-        showArgMismatch(argv[0]);
-        return false;
-    }
+    *opts = tpm2_options_new("C:P:", ARRAY_LEN(topts), topts, on_option, on_arg,
+            0);
 
-    int opt;
-    bool result;
-    while ((opt = getopt_long(argc, argv, "x:a:P:Xp:d:S:hv", long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'x':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->nv_index);
-            if (!result) {
-                LOG_ERR("Could not convert NV index to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-
-            if (ctx->nv_index == 0) {
-                LOG_ERR("NV Index cannot be 0");
-                return false;
-            }
-            break;
-        case 'a':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->auth_handle);
-            if (!result) {
-                LOG_ERR("Could not convert auth handle to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-
-            if (ctx->auth_handle == 0) {
-                LOG_ERR("Auth handle cannot be 0");
-                return false;
-            }
-            break;
-        case 'P':
-            result = password_tpm2_util_copy_password(optarg, "handle password",
-                    &ctx->handle_passwd);
-            if (!result) {
-                return false;
-            }
-            break;
-        case 'X':
-            ctx->is_hex_passwd = true;
-            break;
-        case 'S':
-             if (!tpm2_util_string_to_uint32(optarg, &ctx->auth_session_handle)) {
-                 LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                         optarg);
-                 return false;
-             }
-             ctx->is_auth_session = true;
-             break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
-        }
-    }
-
-    return true;
+    return *opts != NULL;
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
 
-    (void)opts;
-    (void)envp;
+    UNUSED(flags);
 
-    tpm_nvreadlock_ctx ctx = {
-            .nv_index = 0,
-            .auth_handle = TPM_RH_PLATFORM,
-            .size_to_read = 0,
-            .offset = 0,
-            .handle_passwd = TPM2B_EMPTY_INIT,
-            .is_hex_passwd = false,
-            .sapi_context = sapi_context
-    };
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.auth_hierarchy.ctx_path,
+            ctx.auth_hierarchy.auth_str, &ctx.auth_hierarchy.object, false,
+            TPM2_HANDLE_FLAGS_NV | TPM2_HANDLE_FLAGS_O | TPM2_HANDLE_FLAGS_P);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid handle authorization");
+        return rc;
+    }
 
-    bool result = init(argc, argv, &ctx);
+    if (!ctx.cp_hash_path) {
+        return tpm2_nvreadlock(ectx, &ctx.auth_hierarchy.object, ctx.nv_index,
+            NULL);
+    }
+
+    TPM2B_DIGEST cp_hash = { .size = 0 };
+    rc = tpm2_nvreadlock(ectx, &ctx.auth_hierarchy.object, ctx.nv_index,
+        &cp_hash);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
     if (!result) {
-        return 1;
+        rc = tool_rc_general_error;
     }
 
-    return nv_readlock(&ctx) != true;
+    return rc;
 }
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+    if (!ctx.cp_hash_path) {
+        return tpm2_session_close(&ctx.auth_hierarchy.object.session);
+    }
+    return tool_rc_success;
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("nvreadlock", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

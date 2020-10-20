@@ -1,267 +1,348 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
+#include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#include <getopt.h>
-#include <limits.h>
-#include <sapi/tpm20.h>
-
-#include "tpm2_util.h"
-#include "log.h"
 #include "files.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
+#include "log.h"
+#include "tpm2.h"
+#include "tpm2_alg_util.h"
+#include "tpm2_tool.h"
 
 typedef struct tpm_hmac_ctx tpm_hmac_ctx;
 struct tpm_hmac_ctx {
-    TPMS_AUTH_COMMAND session_data;
-    TPMI_DH_OBJECT key_handle;
-    TPMI_ALG_HASH algorithm;
+    struct {
+        char *ctx_path;
+        char *auth_str;
+        tpm2_loaded_object object;
+    } hmac_key;
+
+    FILE *input;
     char *hmac_output_file_path;
-    TPM2B_MAX_BUFFER data;
-    TSS2_SYS_CONTEXT *sapi_context;
-    bool is_auth_session;
-    TPMI_SH_AUTH_SESSION auth_session_handle;
+    char *ticket_path;
+    TPMI_ALG_HASH halg;
+    bool hex;
+    char *cp_hash_path;
 };
 
-static bool do_hmac_and_output(tpm_hmac_ctx *ctx) {
+static tpm_hmac_ctx ctx;
 
-    TPMS_AUTH_RESPONSE session_data_out;
-    TSS2_SYS_CMD_AUTHS sessions_data;
-    TSS2_SYS_RSP_AUTHS sessions_data_out;
-    TPMS_AUTH_COMMAND *session_data_array[1];
-    TPMS_AUTH_RESPONSE *session_data_out_array[1];
+static tool_rc tpm_hmac_file(ESYS_CONTEXT *ectx, TPM2B_DIGEST **result,
+        TPMT_TK_HASHCHECK **validation) {
 
-    TPM2B_DIGEST hmac_out = TPM2B_TYPE_INIT(TPM2B_DIGEST, buffer);
+    unsigned long file_size = 0;
+    FILE *input = ctx.input;
 
-    session_data_array[0] = &ctx->session_data;
-    session_data_out_array[0] = &session_data_out;
-
-    sessions_data_out.rspAuths = &session_data_out_array[0];
-    sessions_data.cmdAuths = &session_data_array[0];
-
-    sessions_data_out.rspAuthsCount = 1;
-    sessions_data.cmdAuthsCount = 1;
-
-    ctx->session_data.sessionHandle = TPM_RS_PW;
-
-    if(ctx->is_auth_session) {
-        ctx->session_data.sessionHandle = ctx->auth_session_handle;
-    }
-
-    TPM_RC rval = Tss2_Sys_HMAC(ctx->sapi_context, ctx->key_handle,
-            &sessions_data, &ctx->data, ctx->algorithm, &hmac_out,
-            &sessions_data_out);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("TPM2_HMAC Error. TPM Error:0x%x", rval);
-        return -1;
-    }
-
-    printf("\nhmac value(hex type): ");
-    UINT16 i;
-    for (i = 0; i < hmac_out.t.size; i++)
-        printf("%02x ", hmac_out.t.buffer[i]);
-    printf("\n");
-
-    /* TODO fix serialization */
-    return files_save_bytes_to_file(ctx->hmac_output_file_path, (UINT8 *) &hmac_out,
-            sizeof(hmac_out));
-}
-
-#define ARG_CNT(optional) ((int)(2 * (sizeof(long_options)/sizeof(long_options[0]) - optional - 1)))
-
-static bool init(int argc, char *argv[], tpm_hmac_ctx *ctx) {
-
-    bool result = false;
-    bool is_hex_passwd = false;
-    char *contextKeyFile = NULL;
-
-    const char *optstring = "k:P:g:I:o:S:c:X";
-    static struct option long_options[] = {
-        {"keyHandle",   required_argument, NULL, 'k'},
-        {"keyContext",  required_argument, NULL, 'c'},
-        {"pwdk",        required_argument, NULL, 'P'},
-        {"algorithm",   required_argument, NULL, 'g'},
-        {"infile",      required_argument, NULL, 'I'},
-        {"outfile",     required_argument, NULL, 'o'},
-        {"input-session-handle",1,         NULL, 'S'},
-        {"passwdInHex", no_argument,       NULL, 'X'},
-        {NULL,          no_argument,       NULL, '\0'}
-    };
-
-    union {
-        struct {
-            UINT8 k : 1;
-            UINT8 P : 1;
-            UINT8 g : 1;
-            UINT8 I : 1;
-            UINT8 o : 1;
-            UINT8 c : 1;
-            UINT8 unused : 2;
-        };
-        UINT8 all;
-    } flags = { .all = 0 };
+    tool_rc rc;
+    /* Suppress error reporting with NULL path */
+    bool res = files_get_file_size(input, &file_size, NULL);
 
     /*
-     * argc should be bound by the maximum and minimum option count.
-     * subtract 1 from argc to disregard argv[0]
+     * If we can get the file size and its less than 1024, just do it in one hash invocation.
+     * We can't use the one-shot command if we require ticket, as it doesn't provide it in
+     * the response from the TPM.
      */
-    if ((argc - 1) < 1 || (argc - 1) > ARG_CNT(0)) {
-        showArgMismatch(argv[0]);
-        return false;
+    if (!ctx.ticket_path && res && file_size <= TPM2_MAX_DIGEST_BUFFER) {
+
+        TPM2B_MAX_BUFFER buffer = { .size = file_size };
+
+        res = files_read_bytes(ctx.input, buffer.buffer, buffer.size);
+        if (!res) {
+            LOG_ERR("Error reading input file!");
+            return tool_rc_general_error;
+        }
+
+        if (ctx.cp_hash_path) {
+            LOG_WARN("Exiting without performing HMAC when calculating cpHash");
+            TPM2B_DIGEST cp_hash = { .size = 0 };
+            tool_rc rc = tpm2_hmac(ectx, &ctx.hmac_key.object, ctx.halg,
+            &buffer, result, &cp_hash);
+            if (rc != tool_rc_success) {
+                return rc;
+            }
+
+            bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+            if (!result) {
+                rc = tool_rc_general_error;
+            }
+            return rc;
+        }
+        /*
+         * hash algorithm specified in the key's scheme is used as the
+         * hash algorithm for the HMAC
+         */
+        return tpm2_hmac(ectx, &ctx.hmac_key.object, ctx.halg, &buffer, result,
+        NULL);
     }
 
-    int opt = -1;
-    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'k':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->key_handle);
-            if (!result) {
-                LOG_ERR("Could not convert key handle to number, got \"%s\"",
-                        optarg);
-                return false;
+    if (ctx.cp_hash_path) {
+        LOG_ERR("Cannot calculate cpHash for buffers requiring HMAC sequence.");
+        return tool_rc_general_error;
+    }
+
+    ESYS_TR sequence_handle;
+    /*
+     * Size is either unknown because the FILE * is a fifo, or it's too big
+     * to do in a single hash call. Based on the size figure out the chunks
+     * to loop over, if possible. This way we can call Complete with data.
+     */
+    rc = tpm2_hmac_start(ectx, &ctx.hmac_key.object, ctx.halg,
+            &sequence_handle);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    /* If we know the file size, we decrement the amount read and terminate the
+     * loop when 1 block is left, else we go till feof.
+     */
+    size_t left = file_size;
+    bool use_left = !!res;
+
+    TPM2B_MAX_BUFFER data;
+
+    bool done = false;
+    while (!done) {
+
+        size_t bytes_read = fread(data.buffer, 1,
+                BUFFER_SIZE(typeof(data), buffer), input);
+        if (ferror(input)) {
+            LOG_ERR("Error reading from input file");
+            return tool_rc_general_error;
+        }
+
+        data.size = bytes_read;
+
+        /* if data was read, update the sequence */
+        rc = tpm2_hmac_sequenceupdate(ectx, sequence_handle,
+                &ctx.hmac_key.object, &data);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+
+        if (use_left) {
+            left -= bytes_read;
+            if (left <= TPM2_MAX_DIGEST_BUFFER) {
+                done = true;
+                continue;
             }
-            flags.k = 1;
-            break;
-        case 'P':
-            result = password_tpm2_util_copy_password(optarg, "key handle",
-                    &ctx->session_data.hmac);
-            if (!result) {
-                return false;
-            }
-            flags.P = 1;
-            break;
-        case 'g':
-            result = tpm2_util_string_to_uint16(optarg, &ctx->algorithm);
-            if (!result) {
-                LOG_ERR("Could not convert algorithm to number, got \"%s\"",
-                        optarg);
-                return false;
-            }
-            flags.g = 1;
-            break;
-        case 'I':
-            ctx->data.t.size = BUFFER_SIZE(TPM2B_MAX_BUFFER, buffer);
-            result = files_load_bytes_from_file(optarg, ctx->data.t.buffer,
-                    &ctx->data.t.size);
-            if (!result) {
-                return false;
-            }
-            flags.I = 1;
-            break;
-        case 'o':
-            result = files_does_file_exist(optarg);
-            if (result) {
-                return false;
-            }
-            ctx->hmac_output_file_path = optarg;
-            flags.o = 1;
-            break;
-        case 'c':
-            if (contextKeyFile) {
-                LOG_ERR("Multiple specifications of -c");
-                return false;
-            }
-            contextKeyFile = optarg;
-            flags.c = 1;
-            break;
-        case 'X':
-            is_hex_passwd = true;
-            break;
-        case 'S':
-            if (!tpm2_util_string_to_uint32(optarg, &ctx->auth_session_handle)) {
-                LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            ctx->is_auth_session = true;
-            break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
+        } else if (feof(input)) {
+            done = true;
+        }
+    } /* end file read/hash update loop */
+
+    if (use_left) {
+        data.size = left;
+        bool res = files_read_bytes(input, data.buffer, left);
+        if (!res) {
+            LOG_ERR("Error reading from input file.");
+            return tool_rc_general_error;
+        }
+    } else {
+        data.size = 0;
+    }
+
+    rc = tpm2_hmac_sequencecomplete(ectx, sequence_handle, &ctx.hmac_key.object,
+            &data, result, validation);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    return tool_rc_success;
+}
+
+static tool_rc do_hmac_and_output(ESYS_CONTEXT *ectx) {
+
+    TPM2B_DIGEST *hmac_out = NULL;
+    TPMT_TK_HASHCHECK *validation = NULL;
+
+    FILE *out = stdout;
+
+    tool_rc rc = tpm_hmac_file(ectx, &hmac_out, &validation);
+    if (rc != tool_rc_success || ctx.cp_hash_path) {
+        goto out;
+    }
+
+    assert(hmac_out);
+
+    if (ctx.ticket_path) {
+        bool res = files_save_validation(validation, ctx.ticket_path);
+        if (!res) {
+            rc = tool_rc_general_error;
+            goto out;
         }
     }
 
-    /*
-     * Options g, I, o must be specified and k or c must be specified.
-     */
-    if (!((flags.k || flags.c) && flags.I && flags.o && flags.g)) {
-        LOG_ERR("Must specify options g, i, o and k or c");
-        return false;
+    rc = tool_rc_general_error;
+    if (ctx.hmac_output_file_path) {
+        out = fopen(ctx.hmac_output_file_path, "wb+");
+        if (!out) {
+            LOG_ERR("Could not open output file \"%s\", error: %s",
+                    ctx.hmac_output_file_path, strerror(errno));
+            goto out;
+        }
+    } else if (!output_enabled) {
+        rc = tool_rc_success;
+        goto out;
     }
 
-    if (flags.c) {
-        result = file_load_tpm_context_from_file(ctx->sapi_context, &ctx->key_handle,
-                contextKeyFile);
-        if (!result) {
-            LOG_ERR("Loading tpm context from file \"%s\" failed.",
-                    contextKeyFile);
-            return false;
+    if (ctx.hex) {
+        tpm2_util_print_tpm2b2(out, hmac_out);
+    } else {
+
+        bool res = files_write_bytes(out, hmac_out->buffer, hmac_out->size);
+        if (!res) {
+            goto out;
         }
     }
 
-    /* convert a hex password if needed */
-    return password_tpm2_util_to_auth(&ctx->session_data.hmac, is_hex_passwd,
-            "key handle", &ctx->session_data.hmac);
-}
+    rc = tool_rc_success;
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
-
-    (void)opts;
-    (void)envp;
-
-    tpm_hmac_ctx ctx = {
-            .session_data = TPMS_AUTH_COMMAND_EMPTY_INIT,
-            .key_handle = 0,
-            .sapi_context = sapi_context,
-            .is_auth_session = false
-    };
-
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        return 1;
+out:
+    if (out && out != stdout) {
+        fclose(out);
     }
 
-    return do_hmac_and_output(&ctx) != true;
+    free(hmac_out);
+    free(validation);
+    return rc;
 }
+
+static bool on_option(char key, char *value) {
+
+    switch (key) {
+    case 'c':
+        ctx.hmac_key.ctx_path = value;
+        break;
+    case 'p':
+        ctx.hmac_key.auth_str = value;
+        break;
+    case 'o':
+        ctx.hmac_output_file_path = value;
+        break;
+    case 'g':
+        ctx.halg = tpm2_alg_util_from_optarg(value, tpm2_alg_util_flags_hash);
+        if (ctx.halg == TPM2_ALG_ERROR) {
+            return false;
+        }
+        break;
+    case 't':
+        ctx.ticket_path = value;
+        break;
+    case 0:
+        ctx.hex = true;
+        break;
+    case 1:
+        ctx.cp_hash_path = value;
+        break;
+        /* no default */
+    }
+
+    return true;
+}
+
+static bool on_args(int argc, char **argv) {
+
+    if (argc > 1) {
+        LOG_ERR("Expected 1 hmac input file, got: %d", argc);
+        return false;
+    }
+
+    ctx.input = fopen(argv[0], "rb");
+    if (!ctx.input) {
+        LOG_ERR("Error opening file \"%s\", error: %s", argv[0],
+                strerror(errno));
+        return false;
+    }
+
+    return true;
+}
+
+static bool tpm2_tool_onstart(tpm2_options **opts) {
+
+    const struct option topts[] = {
+        { "key-context",    required_argument, NULL, 'c' },
+        { "auth",           required_argument, NULL, 'p' },
+        { "output",         required_argument, NULL, 'o' },
+        { "hash-algorithm", required_argument, NULL, 'g' },
+        { "ticket",         required_argument, NULL, 't' },
+        { "hex",            no_argument,       NULL,  0  },
+        { "cphash",         required_argument, NULL,  1  },
+    };
+
+    ctx.input = stdin;
+
+    *opts = tpm2_options_new("c:p:o:g:t:", ARRAY_LEN(topts), topts, on_option,
+            on_args, 0);
+
+    return *opts != NULL;
+}
+
+static tool_rc readpub(ESYS_CONTEXT *ectx, ESYS_TR handle,
+        TPM2B_PUBLIC **public) {
+
+    return tpm2_readpublic(ectx, handle, public, NULL, NULL);
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    /*
+     * Option C must be specified.
+     */
+    if (!ctx.hmac_key.ctx_path) {
+        LOG_ERR("Must specify options C.");
+        return tool_rc_option_error;
+    }
+
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.hmac_key.ctx_path,
+            ctx.hmac_key.auth_str, &ctx.hmac_key.object, false,
+            TPM2_HANDLE_ALL_W_NV);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid key handle authorization");
+        return rc;
+    }
+
+    /*
+     * if no halg was specified, read the public portion of the key and use it's
+     * scheme
+     */
+    if (!ctx.halg) {
+        TPM2B_PUBLIC *pub = NULL;
+        rc = readpub(ectx, ctx.hmac_key.object.tr_handle, &pub);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+
+        /*
+         * if we're attempting to figure out a hashing scheme, and the scheme is NULL
+         * we default to sha256.
+         */
+        ctx.halg =
+                pub->publicArea.parameters.keyedHashDetail.scheme.details.hmac.hashAlg;
+        if (ctx.halg == TPM2_ALG_NULL) {
+            ctx.halg = TPM2_ALG_SHA256;
+        }
+
+        free(pub);
+    }
+
+    return do_hmac_and_output(ectx);
+}
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+
+    if (ctx.input && ctx.input != stdin) {
+        fclose(ctx.input);
+    }
+
+    return tpm2_session_close(&ctx.hmac_key.object.session);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("hmac", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

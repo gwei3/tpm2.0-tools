@@ -1,253 +1,446 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
+#include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-
-#include <limits.h>
-#include <ctype.h>
-#include <getopt.h>
-
-#include <sapi/tpm20.h>
 
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
+#include "tpm2.h"
+#include "tpm2_tool.h"
+#include "tpm2_alg_util.h"
+#include "tpm2_auth_util.h"
+#include "tpm2_options.h"
+
+#define MAX_INPUT_DATA_SIZE UINT16_MAX
 
 typedef struct tpm_encrypt_decrypt_ctx tpm_encrypt_decrypt_ctx;
 struct tpm_encrypt_decrypt_ctx {
-    TPMS_AUTH_COMMAND session_data;
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } encryption_key;
+
     TPMI_YES_NO is_decrypt;
-    TPMI_DH_OBJECT key_handle;
-    TPM2B_MAX_BUFFER data;
+
+    uint8_t input_data[MAX_INPUT_DATA_SIZE];
+    uint16_t input_data_size;
+
+    const char *input_path;
     char *out_file_path;
-    TSS2_SYS_CONTEXT *sapi_context;
+
+    uint8_t padded_block_len;
+    bool is_padding_option_enabled;
+
+    TPMI_ALG_SYM_MODE mode;
+    struct {
+        char *in;
+        char *out;
+    } iv;
+
+    TPM2B_IV iv_start;
+    char *cp_hash_path;
 };
 
-static bool encryptDecrypt(tpm_encrypt_decrypt_ctx *ctx) {
+static tpm_encrypt_decrypt_ctx ctx = {
+    .mode = TPM2_ALG_NULL,
+    .input_data_size = MAX_INPUT_DATA_SIZE,
+    .padded_block_len = TPM2_MAX_SYM_BLOCK_SIZE,
+    .is_padding_option_enabled = false,
+    .iv_start = { .size = sizeof(ctx.iv_start.buffer), .buffer = { 0 } },
+};
 
-    TPM2B_MAX_BUFFER out_data = TPM2B_TYPE_INIT(TPM2B_MAX_BUFFER, buffer);
+static tool_rc readpub(ESYS_CONTEXT *ectx, TPM2B_PUBLIC **public) {
 
-    TPM2B_IV iv_out = TPM2B_TYPE_INIT(TPM2B_IV, buffer);
-
-    TSS2_SYS_CMD_AUTHS sessions_data;
-    TPMS_AUTH_RESPONSE session_data_out;
-    TSS2_SYS_RSP_AUTHS sessions_data_out;
-    TPMS_AUTH_COMMAND *session_data_array[1];
-    TPMS_AUTH_RESPONSE *session_data_out_array[1];
-
-    session_data_array[0] = &ctx->session_data;
-    sessions_data.cmdAuths = &session_data_array[0];
-    session_data_out_array[0] = &session_data_out;
-    sessions_data_out.rspAuths = &session_data_out_array[0];
-    sessions_data_out.rspAuthsCount = 1;
-
-    sessions_data.cmdAuthsCount = 1;
-    sessions_data.cmdAuths[0] = &ctx->session_data;
-
-    TPM2B_IV iv_in = {
-        .t = {
-            .size = MAX_SYM_BLOCK_SIZE,
-            .buffer = { 0 }
-        },
-    };
-
-    TPM_RC rval = Tss2_Sys_EncryptDecrypt(ctx->sapi_context, ctx->key_handle,
-            &sessions_data, ctx->is_decrypt, TPM_ALG_NULL, &iv_in, &ctx->data, &out_data,
-            &iv_out, &sessions_data_out);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("EncryptDecrypt failed, error code: 0x%x\n", rval);
-        return false;
-    }
-
-    return files_save_bytes_to_file(ctx->out_file_path, (UINT8 *) out_data.t.buffer,
-            out_data.t.size);
+    return tpm2_readpublic(ectx, ctx.encryption_key.object.tr_handle,
+            public, NULL, NULL);
 }
 
-static bool init(int argc, char *argv[], tpm_encrypt_decrypt_ctx *ctx) {
+static bool evaluate_pkcs7_padding_requirements(uint16_t remaining_bytes,
+bool expected) {
 
-    bool result = false;
-    bool is_hex_passwd = false;
-
-    int opt = -1;
-    const char *optstring = "k:P:D:I:o:c:S:X";
-    static struct option long_options[] = {
-      {"keyHandle",   required_argument, NULL, 'k'},
-      {"pwdk",        required_argument, NULL, 'P'},
-      {"decrypt",     required_argument, NULL, 'D'},
-      {"inFile",      required_argument, NULL, 'I'},
-      {"outFile",     required_argument, NULL, 'o'},
-      {"keyContext",  required_argument, NULL, 'c'},
-      {"passwdInHex", no_argument,       NULL, 'X'},
-      {"input-session-handle",1,         NULL, 'S'},
-      {NULL,          no_argument,       NULL, '\0'}
-    };
-
-    union {
-        struct {
-            UINT8 k : 1;
-            UINT8 P : 1;
-            UINT8 D : 1;
-            UINT8 I : 1;
-            UINT8 o : 1;
-            UINT8 c : 1;
-            UINT8 X : 1;
-            UINT8 unused : 1;
-        };
-        UINT8 all;
-    } flags = { .all = 0 };
-
-    char *contextKeyFile = NULL;
-
-    if (argc == 1) {
-        showArgMismatch(argv[0]);
+    if (!ctx.is_padding_option_enabled) {
         return false;
     }
 
-    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL)) != -1) {
-        switch (opt) {
-        case 'k':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->key_handle);
-            if (!result) {
-                LOG_ERR("Could not convert keyhandle to number, got: \"%s\"",
-                        optarg);
-                return result;
-            }
-            flags.k = 1;
-            break;
-        case 'P':
-            result = password_tpm2_util_copy_password(optarg, "key", &ctx->session_data.hmac);
-            if (!result) {
-                return result;
-            }
-            flags.P = 1;
-            break;
-        case 'D':
-            if (!strcasecmp("YES", optarg)) {
-                ctx->is_decrypt = YES;
-            } else if (!strcasecmp("NO", optarg)) {
-                ctx->is_decrypt = NO;
-            } else {
-                showArgError(optarg, argv[0]);
-                return result;
-            }
-            break;
-        case 'I':
-            ctx->data.t.size = sizeof(ctx->data) - 2;
-            result = files_load_bytes_from_file(optarg, ctx->data.t.buffer, &ctx->data.t.size);
-            if (!result) {
-                return result;
-            }
-            flags.I = 1;
-            break;
-        case 'o':
-            result = files_does_file_exist(optarg);
-            if (result) {
-                return result;
-            }
-            ctx->out_file_path = optarg;
-            flags.o = 1;
-            break;
-        case 'c':
-            if (contextKeyFile) {
-                LOG_ERR("Multiple specifications of -c");
-                return result;
-            }
-            contextKeyFile = optarg;
-            flags.c = 1;
-            break;
-        case 'X':
-            is_hex_passwd = true;
-            break;
-        case 'S':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->session_data.sessionHandle);
-            if (!result) {
-                 LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                         optarg);
-                 return result;
-             }
-             break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return result;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return result;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return result;
+    if (ctx.is_decrypt != expected) {
+        return false;
+    }
+
+    /*
+     * If no ctx.mode was specified, the default cfb was set.
+     */
+    if (ctx.mode != TPM2_ALG_CBC && ctx.mode != TPM2_ALG_ECB) {
+        return false;
+    }
+
+    /*
+     * Is last block?
+     */
+    if (!(remaining_bytes <= TPM2_MAX_DIGEST_BUFFER && remaining_bytes > 0)) {
+        return false;
+    }
+
+    LOG_WARN("Processing pkcs7 padding.");
+
+    return true;
+}
+
+static void append_pkcs7_padding_data_to_input(uint8_t *pad_data,
+        uint16_t *in_data_size, uint16_t *remaining_bytes) {
+
+    bool test_pad_reqs = evaluate_pkcs7_padding_requirements(*remaining_bytes,
+    false);
+    if (!test_pad_reqs) {
+        return;
+    }
+
+    *pad_data = ctx.padded_block_len - (*in_data_size % ctx.padded_block_len);
+
+    memset(&ctx.input_data[ctx.input_data_size], *pad_data, *pad_data);
+
+    if (*pad_data == ctx.padded_block_len) {
+        *remaining_bytes += *pad_data;
+    }
+
+    if (*pad_data < ctx.padded_block_len) {
+        *remaining_bytes = *in_data_size += *pad_data;
+    }
+}
+
+static void strip_pkcs7_padding_data_from_output(uint8_t *pad_data,
+        TPM2B_MAX_BUFFER *out_data, uint16_t *remaining_bytes) {
+
+    bool test_pad_reqs = evaluate_pkcs7_padding_requirements(*remaining_bytes,
+    true);
+    if (!test_pad_reqs) {
+        return;
+    }
+
+    uint8_t last_block_length = ctx.padded_block_len
+            - (out_data->size % ctx.padded_block_len);
+
+    if (last_block_length != ctx.padded_block_len) {
+        LOG_WARN("Encrypted input is not block length aligned.");
+    }
+
+    *pad_data = out_data->buffer[last_block_length - 1];
+
+    out_data->size -= *pad_data;
+}
+
+static tool_rc encrypt_decrypt(ESYS_CONTEXT *ectx) {
+
+    tool_rc rc = tool_rc_general_error;
+
+    /*
+     * try EncryptDecrypt2 first, and if the command is not supported by the TPM
+     * fall back to EncryptDecrypt.
+     */
+
+    UINT16 data_offset = 0;
+    bool result = true;
+    FILE *out_file_ptr =
+            ctx.out_file_path ? fopen(ctx.out_file_path, "wb+") : stdout;
+    if (!out_file_ptr) {
+        LOG_ERR("Could not open file \"%s\", error: %s", ctx.out_file_path,
+                strerror(errno));
+        return tool_rc_general_error;
+    }
+
+    TPM2B_MAX_BUFFER *out_data = NULL;
+    TPM2B_MAX_BUFFER in_data;
+    TPM2B_IV *iv_out = NULL;
+    TPM2B_IV *iv_in = &ctx.iv_start;
+    uint8_t pad_data = 0;
+
+    uint16_t remaining_bytes = ctx.input_data_size;
+    if (ctx.mode == TPM2_ALG_ECB) {
+        iv_in = NULL;
+    }
+
+    if (ctx.cp_hash_path) {
+        in_data.size = remaining_bytes;
+        append_pkcs7_padding_data_to_input(&pad_data, &in_data.size,
+                    &remaining_bytes);
+        memcpy(in_data.buffer, ctx.input_data, in_data.size);
+        LOG_WARN("Calculating cpHash. Exiting without performing encryptdecrypt.");
+        TPM2B_DIGEST cp_hash = { .size = 0 };
+        tool_rc rc = tpm2_encryptdecrypt(ectx, &ctx.encryption_key.object,
+        ctx.is_decrypt, ctx.mode, iv_in, &in_data, &out_data, &iv_out,
+        &cp_hash);
+        if (rc != tool_rc_success) {
+            LOG_ERR("CpHash calculation failed!");
+            fclose(out_file_ptr);
+            return rc;
+        }
+
+        bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+        if (!result) {
+            rc = tool_rc_general_error;
+        }
+        return rc;
+    }
+
+    while (remaining_bytes > 0) {
+        in_data.size =
+                remaining_bytes > TPM2_MAX_DIGEST_BUFFER ?
+                        TPM2_MAX_DIGEST_BUFFER : remaining_bytes;
+
+        if (!pad_data) {
+            append_pkcs7_padding_data_to_input(&pad_data, &in_data.size,
+                    &remaining_bytes);
+        }
+
+        memcpy(in_data.buffer, &ctx.input_data[data_offset], in_data.size);
+
+        rc = tpm2_encryptdecrypt(ectx, &ctx.encryption_key.object,
+                ctx.is_decrypt, ctx.mode, iv_in, &in_data, &out_data, &iv_out,
+                NULL);
+        if (rc != tool_rc_success) {
+            goto out;
+        }
+
+        /*
+         * Copy iv_out iv_in to use it in next loop iteration.
+         * This copy is also output from the tool for further chaining.
+         */
+        if (ctx.mode != TPM2_ALG_ECB) {
+            assert(iv_in);
+            assert(iv_out);
+            *iv_in = *iv_out;
+            free(iv_out);
+        }
+
+        strip_pkcs7_padding_data_from_output(&pad_data, out_data,
+                &remaining_bytes);
+
+        result = files_write_bytes(out_file_ptr, out_data->buffer,
+                out_data->size);
+        free(out_data);
+        if (!result) {
+            LOG_ERR("Failed to save output data to file");
+            goto out;
+        }
+
+        remaining_bytes -= in_data.size;
+        data_offset += in_data.size;
+    }
+
+    /*
+     * iv_in here is the copy of final iv_out from the loop above.
+     */
+    result =
+            (ctx.iv.out && iv_in) ?
+                    files_save_bytes_to_file(ctx.iv.out, iv_in->buffer,
+                            iv_in->size) :
+                    true;
+    if (!result) {
+        goto out;
+    }
+
+    rc = tool_rc_success;
+
+out:
+    if (out_file_ptr != stdout) {
+        fclose(out_file_ptr);
+    }
+
+    return rc;
+}
+
+static void parse_iv(char *value) {
+
+    ctx.iv.in = value;
+
+    char *split = strchr(value, ':');
+    if (split) {
+        *split = '\0';
+        split++;
+        if (split) {
+            ctx.iv.out = split;
+        }
+    }
+}
+
+static bool setup_alg_mode(ESYS_CONTEXT *ectx) {
+
+    TPM2B_PUBLIC *public;
+    tool_rc rc = readpub(ectx, &public);
+    if (rc != tool_rc_success) {
+        return false;
+    }
+    /*
+     * Sym objects can have a NULL mode, which means the caller can and must determine mode.
+     * Thus if the caller doesn't specify an algorithm, and the object has a default mode, choose it,
+     * else choose CFB.
+     * If the caller specifies an invalid mode, just pass it to the TPM and let it error out.
+     */
+    if (ctx.mode == TPM2_ALG_NULL) {
+
+        TPMI_ALG_SYM_MODE objmode =
+            public->publicArea.parameters.symDetail.sym.mode.sym;
+        if (objmode == TPM2_ALG_NULL) {
+            ctx.mode = TPM2_ALG_CFB;
+        } else {
+            ctx.mode = objmode;
         }
     }
 
-    if (!((flags.k || flags.c) && flags.I && flags.o)) {
-        LOG_ERR("Invalid arguments");
+    free(public);
+
+    return true;
+}
+
+static bool on_option(char key, char *value) {
+
+    switch (key) {
+    case 'c':
+        ctx.encryption_key.ctx_path = value;
+        break;
+    case 'p':
+        ctx.encryption_key.auth_str = value;
+        break;
+    case 'd':
+        ctx.is_decrypt = 1;
+        break;
+    case 'o':
+        ctx.out_file_path = value;
+        break;
+    case 'G':
+        ctx.mode = tpm2_alg_util_strtoalg(value, tpm2_alg_util_flags_mode);
+        if (ctx.mode == TPM2_ALG_ERROR) {
+            LOG_ERR("Invalid mode, got: %s", value);
+            return false;
+        }
+        break;
+    case 't':
+        parse_iv(value);
+        break;
+    case 'e':
+        ctx.is_padding_option_enabled = true;
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
+    }
+
+    return true;
+}
+
+static bool on_args(int argc, char *argv[]) {
+
+    if (argc != 1) {
+        LOG_ERR("Expected one input file, got: %d", argc);
+        return false;
+    }
+
+    ctx.input_path = argv[0];
+
+    return true;
+}
+
+static bool tpm2_tool_onstart(tpm2_options **opts) {
+
+    const struct option topts[] = {
+        { "auth",        required_argument, NULL, 'p' },
+        { "decrypt",     no_argument,       NULL, 'd' },
+        { "iv",          required_argument, NULL, 't' },
+        { "mode",        required_argument, NULL, 'G' },
+        { "output",      required_argument, NULL, 'o' },
+        { "key-context", required_argument, NULL, 'c' },
+        { "pad",         no_argument,       NULL, 'e' },
+        { "cphash",      required_argument, NULL,  0  },
+    };
+
+    *opts = tpm2_options_new("p:edi:o:c:G:t:", ARRAY_LEN(topts), topts,
+            on_option, on_args, 0);
+
+    return *opts != NULL;
+}
+
+static bool is_input_options_args_valid(void) {
+
+    if (!ctx.encryption_key.ctx_path) {
+        LOG_ERR("Expected a context file or handle, got none.");
+        return false;
+    }
+
+    bool result = files_load_bytes_from_buffer_or_file_or_stdin(NULL,
+            ctx.input_path, &ctx.input_data_size, ctx.input_data);
+    if (!result) {
+        LOG_ERR("Failed to read in the input.");
         return result;
     }
 
-    if (flags.c) {
-        result = file_load_tpm_context_from_file(ctx->sapi_context, &ctx->key_handle, contextKeyFile);
+    if (!ctx.iv.in) {
+        LOG_WARN("Using a weak IV, try specifying an IV");
+    }
+
+    if (ctx.iv.in) {
+        unsigned long file_size;
+        result = files_get_file_size_path(ctx.iv.in, &file_size);
         if (!result) {
-            return result;
+            LOG_ERR("Could not retrieve iv file size.");
+            return false;
+        }
+
+        if (file_size != ctx.iv_start.size) {
+            LOG_ERR("Iv should be 16 bytes, got %lu", file_size);
+            return false;
+        }
+
+        result = files_load_bytes_from_path(ctx.iv.in, ctx.iv_start.buffer,
+        &ctx.iv_start.size);
+        if (!result) {
+            LOG_ERR("Could not load the iv from the file.");
+            return false;
         }
     }
 
-    return password_tpm2_util_to_auth(&ctx->session_data.hmac, is_hex_passwd, "key",
-            &ctx->session_data.hmac);
-}
-
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
-
-    /* opts and envp are unused, avoid compiler warning */
-    (void) opts;
-    (void) envp;
-
-    tpm_encrypt_decrypt_ctx ctx = {
-        .session_data = TPMS_AUTH_COMMAND_EMPTY_INIT,
-        .is_decrypt = NO,
-        .data = TPM2B_EMPTY_INIT,
-        .sapi_context = sapi_context
-    };
-
-    ctx.session_data.sessionHandle = TPM_RS_PW;
-
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
+    if (ctx.cp_hash_path && ctx.input_data_size > TPM2_MAX_DIGEST_BUFFER) {
+        LOG_ERR("Cannot calculate cpHash for buffer larger than max digest buffer.");
         return false;
     }
 
-    return encryptDecrypt(&ctx) != true;
+    return true;
 }
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    bool retval = is_input_options_args_valid();
+    if (!retval) {
+        return tool_rc_option_error;
+    }
+
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.encryption_key.ctx_path,
+            ctx.encryption_key.auth_str, &ctx.encryption_key.object, false,
+            TPM2_HANDLE_ALL_W_NV);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid object key authorization");
+        return rc;
+    }
+
+    bool result = setup_alg_mode(ectx);
+    if (!result) {
+        LOG_ERR("Failure to setup key mode.");
+        return tool_rc_general_error;
+    }
+
+    return encrypt_decrypt(ectx);
+}
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+
+    return tpm2_session_close(&ctx.encryption_key.object.session);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("encryptdecrypt", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

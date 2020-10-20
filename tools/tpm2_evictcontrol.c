@@ -1,241 +1,216 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
-
+/* SPDX-License-Identifier: BSD-3-Clause */
 
 #include <stdbool.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-
-#include <limits.h>
-#include <ctype.h>
-#include <getopt.h>
-
-#include <sapi/tpm20.h>
 
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
+#include "tpm2.h"
+#include "tpm2_capability.h"
+#include "tpm2_tool.h"
 
 typedef struct tpm_evictcontrol_ctx tpm_evictcontrol_ctx;
 struct tpm_evictcontrol_ctx {
-    TPMS_AUTH_COMMAND session_data;
-    TPMI_RH_PROVISION auth;
     struct {
-        TPMI_DH_OBJECT object;
-        TPMI_DH_OBJECT persist;
-    } handle;
-    TSS2_SYS_CONTEXT *sapi_context;
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } auth_hierarchy;
+
+    struct {
+        char *ctx_path;
+        tpm2_loaded_object object;
+    } to_persist_key;
+
+    TPMI_DH_PERSISTENT persist_handle;
+
+    const char *output_arg;
+
+    struct {
+        UINT8 p :1;
+        UINT8 c :1;
+        UINT8 o :1;
+    } flags;
+    char *cp_hash_path;
 };
 
-static int evict_control(tpm_evictcontrol_ctx *ctx) {
+static tpm_evictcontrol_ctx ctx = {
+    .auth_hierarchy.ctx_path="o",
+};
 
-    TPMS_AUTH_RESPONSE session_data_out;
-    TSS2_SYS_CMD_AUTHS sessions_data;
-    TSS2_SYS_RSP_AUTHS sessions_data_out;
-    TPMS_AUTH_COMMAND *session_data_array[1];
-    TPMS_AUTH_RESPONSE *session_ata_out_array[1];
+static bool on_option(char key, char *value) {
 
-    session_data_array[0] = &ctx->session_data;
-    session_ata_out_array[0] = &session_data_out;
-
-    sessions_data_out.rspAuths = &session_ata_out_array[0];
-    sessions_data.cmdAuths = &session_data_array[0];
-
-    sessions_data_out.rspAuthsCount = 1;
-    sessions_data.cmdAuthsCount = 1;
-
-    TPM_RC rval = Tss2_Sys_EvictControl(ctx->sapi_context, ctx->auth, ctx->handle.object, &sessions_data, ctx->handle.persist,&sessions_data_out);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("EvictControl failed, error code: 0x%x\n", rval);
-        return false;
+    switch (key) {
+    case 'C':
+        ctx.auth_hierarchy.ctx_path = value;
+        break;
+    case 'P':
+        ctx.auth_hierarchy.auth_str = value;
+        break;
+    case 'c':
+        ctx.to_persist_key.ctx_path = value;
+        ctx.flags.c = 1;
+        break;
+    case 'o':
+        ctx.output_arg = value;
+        ctx.flags.o = 1;
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
     }
+
     return true;
 }
 
-static bool init(int argc, char *argv[], tpm_evictcontrol_ctx *ctx) {
+static bool on_arg(int argc, char *argv[]) {
 
-    const char *optstring = "A:H:S:P:c:i:X";
-    static struct option long_options[] = {
-      {"auth",        required_argument, NULL, 'A'},
-      {"handle",      required_argument, NULL, 'H'},
-      {"persistent",  required_argument, NULL, 'S'},
-      {"pwda",        required_argument, NULL, 'P'},
-      {"context",     required_argument, NULL, 'c'},
-      {"passwdInHex", no_argument,       NULL, 'X'},
-      {"input-session-handle",1,         NULL, 'i'},
-      {NULL,          no_argument,       NULL, '\0'}
+    if (argc > 1) {
+        LOG_ERR("Expected at most one persistent handle, got %d", argc);
+        return false;
+    }
+
+    const char *value = argv[0];
+
+    bool result = tpm2_util_string_to_uint32(value, &ctx.persist_handle);
+    if (!result) {
+        LOG_ERR("Could not convert persistent handle to a number, got: \"%s\"",
+                value);
+        return false;
+    }
+    ctx.flags.p = 1;
+
+    return true;
+}
+
+static bool tpm2_tool_onstart(tpm2_options **opts) {
+
+    const struct option topts[] = {
+      { "hierarchy",      required_argument, NULL, 'C' },
+      { "auth",           required_argument, NULL, 'P' },
+      { "object-context", required_argument, NULL, 'c' },
+      { "output",         required_argument, NULL, 'o' },
+      { "cphash",         required_argument, NULL,  0  },
     };
 
-    union {
-        struct {
-            UINT8 A : 1;
-            UINT8 H : 1;
-            UINT8 S : 1;
-            UINT8 c : 1;
-            UINT8 P : 1;
-        };
-        UINT8 all;
-    } flags = { .all = 0 };
+    *opts = tpm2_options_new("C:P:c:o:", ARRAY_LEN(topts), topts, on_option,
+            on_arg, 0);
 
-    char *contextFile = NULL;
+    return *opts != NULL;
+}
 
-    bool is_hex_passwd = false;
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
 
-    if (argc == 1) {
-        showArgMismatch(argv[0]);
-        return false;
+    UNUSED(flags);
+
+    tool_rc rc = tool_rc_general_error;
+    bool evicted = false;
+
+    /* load up the object/handle to work on */
+    tool_rc tmp_rc = tpm2_util_object_load(ectx, ctx.to_persist_key.ctx_path,
+            &ctx.to_persist_key.object, TPM2_HANDLE_ALL_W_NV);
+    if (tmp_rc != tool_rc_success) {
+        rc = tmp_rc;
+        goto out;
     }
 
-    int opt;
-    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'A':
-            if (!strcasecmp(optarg, "o")) {
-                ctx->auth = TPM_RH_OWNER;
-            } else if (!strcasecmp(optarg, "p")) {
-                ctx->auth = TPM_RH_PLATFORM;
-            } else {
-                LOG_ERR("Incorrect auth value, got: \"%s\", expected [o|O|p|P!",
-                        optarg);
-                return false;
-            }
-            flags.A = 1;
-            break;
-        case 'H': {
-            bool result = tpm2_util_string_to_uint32(optarg, &ctx->handle.object);
-            if (!result) {
-                LOG_ERR(
-                        "Could not convert object handle to a number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            flags.H = 1;
-        }
-            break;
-        case 'S': {
-            bool result = tpm2_util_string_to_uint32(optarg, &ctx->handle.persist);
-            if (!result) {
-                LOG_ERR(
-                        "Could not convert persistent handle to a number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            flags.S = 1;
-        }
-            break;
-        case 'P': {
-            bool result = password_tpm2_util_copy_password(optarg, "authenticating",
-                    &ctx->session_data.hmac);
-            if (!result) {
-                return false;
-            }
-            flags.P = 1;
-        }
-            break;
-        case 'c':
-            contextFile = optarg;
-            flags.c = 1;
-            break;
-        case 'X':
-            is_hex_passwd = true;
-            break;
-        case 'i':
-             if (!tpm2_util_string_to_uint32(optarg, &ctx->session_data.sessionHandle)) {
-                 LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                         optarg);
-                 return false;
-             }
-             break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
-        }
+    /* load up the auth hierarchy */
+    tmp_rc = tpm2_util_object_load_auth(ectx, ctx.auth_hierarchy.ctx_path,
+            ctx.auth_hierarchy.auth_str, &ctx.auth_hierarchy.object, false,
+            TPM2_HANDLE_FLAGS_O | TPM2_HANDLE_FLAGS_P);
+    if (tmp_rc != tool_rc_success) {
+        rc = tmp_rc;
+        goto out;
     }
 
-    if (!(flags.A && (flags.H || flags.c) && flags.S)) {
-        LOG_ERR("Invalid arguments");
-        return false;
+    if (ctx.to_persist_key.object.handle >> TPM2_HR_SHIFT
+            == TPM2_HT_PERSISTENT) {
+        ctx.persist_handle = ctx.to_persist_key.object.handle;
+        ctx.flags.p = 1;
     }
 
-    bool result = password_tpm2_util_to_auth(&ctx->session_data.hmac, is_hex_passwd,
-            "authenticating", &ctx->session_data.hmac);
-    if (!result) {
-        return false;
+    /* If we've been given a handle or context object to persist and not an
+     * explicit persistent handle to use, find an available vacant handle in
+     * the persistent namespace and use that.
+     *
+     * XXX: We need away to figure out of object is persistent and skip it.
+     */
+    if (ctx.flags.c && !ctx.flags.p) {
+        bool is_platform = ctx.auth_hierarchy.object.handle == TPM2_RH_PLATFORM;
+        tmp_rc = tpm2_capability_find_vacant_persistent_handle(ectx,
+                is_platform, &ctx.persist_handle);
+        if (tmp_rc != tool_rc_success) {
+            rc = tmp_rc;
+            goto out;
+        }
+        /* we searched and found a persistent handle, so mark that peristent handle valid */
+        ctx.flags.p = 1;
     }
 
-    if (flags.c) {
-        result = file_load_tpm_context_from_file(ctx->sapi_context, &ctx->handle.object,
-                contextFile);
+    if (ctx.flags.o && !ctx.flags.p) {
+        LOG_ERR("Cannot specify -o without using a persistent handle");
+        goto out;
+    }
+
+    ESYS_TR out_tr;
+    if (ctx.cp_hash_path) {
+        TPM2B_DIGEST cp_hash = { .size = 0 };
+        LOG_WARN("Calculating cpHash. Exiting without evicting objects.");
+        tool_rc rc = tpm2_evictcontrol(ectx, &ctx.auth_hierarchy.object,
+        &ctx.to_persist_key.object, ctx.persist_handle, &out_tr, &cp_hash);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+        bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
         if (!result) {
-            return false;
+            rc = tool_rc_general_error;
         }
+        return rc;
     }
 
-    return  true;
-}
-
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
-
-    /* opts and envp are unused, avoid compiler warning */
-    (void) opts;
-    (void) envp;
-
-    tpm_evictcontrol_ctx ctx = {
-            .auth = 0,
-            .handle = { .object = 0, .persist = 0 },
-            .session_data = TPMS_AUTH_COMMAND_EMPTY_INIT,
-            .sapi_context = sapi_context
-    };
-
-    ctx.session_data.sessionHandle = TPM_RS_PW;
-
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        return 1;
+    /*
+     * ESAPI is smart enough that if the object is persistent, to ignore the argument
+     * for persistent handle. Thus we can use ESYS_TR output to determine if it's
+     * evicted or not.
+     */
+    rc = tpm2_evictcontrol(ectx, &ctx.auth_hierarchy.object,
+            &ctx.to_persist_key.object, ctx.persist_handle, &out_tr, NULL);
+    if (rc != tool_rc_success) {
+        goto out;
     }
 
-    /* FIXME required output for testing scripts */
-    printf("persistentHandle: 0x%x\n", ctx.handle.persist);
+    /*
+     * Only Close a TR object if it's still resident in the TPM.
+     * When these handles match, evictcontrol flushed it from the TPM.
+     * It's evicted when ESAPI sends back a none handle on evictcontrol.
+     *
+     * XXX: This output is wrong because we can't determine what handle was
+     * evicted on ESYS_TR input.
+     *
+     * See bug: https://github.com/tpm2-software/tpm2-tools/issues/1816
+     */
+    evicted = out_tr == ESYS_TR_NONE;
+    tpm2_tool_output("persistent-handle: 0x%x\n", ctx.persist_handle);
+    tpm2_tool_output("action: %s\n", evicted ? "evicted" : "persisted");
 
-    return evict_control(&ctx) != true;
+    if (ctx.output_arg) {
+        rc = files_save_ESYS_TR(ectx, out_tr, ctx.output_arg);
+    } else {
+        rc = tool_rc_success;
+    }
+
+out:
+    if (!evicted) {
+        rc = tpm2_close(ectx, &out_tr);
+    }
+
+    return rc;
 }
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+
+    return tpm2_session_close(&ctx.auth_hierarchy.object.session);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("evictcontrol", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

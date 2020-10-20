@@ -1,244 +1,170 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
 #include <stdbool.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
 
-#include <getopt.h>
-
-#include <sapi/tpm20.h>
-
+#include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
+#include "tpm2.h"
+#include "tpm2_tool.h"
+#include "tpm2_options.h"
 
 typedef struct dictionarylockout_ctx dictionarylockout_ctx;
 struct dictionarylockout_ctx {
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } auth_hierarchy;
+
     UINT32 max_tries;
     UINT32 recovery_time;
     UINT32 lockout_recovery_time;
-    TPM2B_AUTH lockout_passwd;
     bool clear_lockout;
     bool setup_parameters;
-    bool use_passwd;
-    TSS2_SYS_CONTEXT *sapi_context;
-    TPMI_SH_AUTH_SESSION auth_session_handle;
-    bool is_session_based_auth;
+    char *cp_hash_path;
 };
 
-bool dictionary_lockout_reset_and_parameter_setup(dictionarylockout_ctx *ctx) {
+static dictionarylockout_ctx ctx = {
+    .auth_hierarchy.ctx_path = "l",
+};
 
-    //Command Auths
-    TPMS_AUTH_COMMAND sessionData = { .sessionHandle = TPM_RS_PW,
-            .nonce.t.size = 0, .hmac.t.size = 0, .sessionAttributes.val = 0 };
-    if (ctx->is_session_based_auth) {
-        sessionData.sessionHandle = ctx->auth_session_handle;
-    }
-    TPMS_AUTH_COMMAND *sessionDataArray[1];
-    sessionDataArray[0] = &sessionData;
+static bool on_option(char key, char *value) {
 
-    TSS2_SYS_CMD_AUTHS sessionsData = { .cmdAuths = &sessionDataArray[0],
-            .cmdAuthsCount = 1 };
-    if (ctx->use_passwd) {
-        bool result = password_tpm2_util_to_auth(&ctx->lockout_passwd, false,
-                "Lockout Password", &sessionData.hmac);
+    bool result;
+
+    switch (key) {
+    case 'c':
+        ctx.clear_lockout = true;
+        break;
+    case 's':
+        ctx.setup_parameters = true;
+        break;
+    case 'p':
+        ctx.auth_hierarchy.auth_str = value;
+        break;
+    case 'n':
+        result = tpm2_util_string_to_uint32(value, &ctx.max_tries);
         if (!result) {
+            LOG_ERR("Could not convert max_tries to number, got: \"%s\"",
+                    value);
             return false;
         }
+
+        if (ctx.max_tries == 0) {
+            return false;
+        }
+        break;
+    case 't':
+        result = tpm2_util_string_to_uint32(value, &ctx.recovery_time);
+        if (!result) {
+            LOG_ERR("Could not convert recovery_time to number, got: \"%s\"",
+                    value);
+            return false;
+        }
+        break;
+    case 'l':
+        result = tpm2_util_string_to_uint32(value, &ctx.lockout_recovery_time);
+        if (!result) {
+            LOG_ERR("Could not convert lockout_recovery_time to number, got: "
+                "\"%s\"", value);
+            return false;
+        }
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
     }
 
-    //Response Auths
-    TPMS_AUTH_RESPONSE *sessionDataOutArray[1], sessionDataOut;
-    sessionDataOutArray[0] = &sessionDataOut;
+    return true;
+}
 
-    TSS2_SYS_RSP_AUTHS sessionsDataOut = { .rspAuths = &sessionDataOutArray[0],
-            .rspAuthsCount = 1 };
+static bool tpm2_tool_onstart(tpm2_options **opts) {
+
+    const struct option topts[] = {
+        { "max-tries",             required_argument, NULL, 'n' },
+        { "recovery-time",         required_argument, NULL, 't' },
+        { "lockout-recovery-time", required_argument, NULL, 'l' },
+        { "auth",                  required_argument, NULL, 'p' },
+        { "clear-lockout",         no_argument,       NULL, 'c' },
+        { "setup-parameters",      no_argument,       NULL, 's' },
+        { "cphash",                required_argument, NULL,  0  },
+    };
+
+    *opts = tpm2_options_new("n:t:l:p:cs", ARRAY_LEN(topts), topts, on_option,
+    NULL, 0);
+
+    return *opts != NULL;
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    if (!ctx.clear_lockout && !ctx.setup_parameters) {
+        LOG_ERR("Invalid operational input: Neither Setup nor Clear lockout "
+                "requested.");
+        return tool_rc_option_error;
+    }
+
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.auth_hierarchy.ctx_path,
+            ctx.auth_hierarchy.auth_str, &ctx.auth_hierarchy.object, false,
+            TPM2_HANDLE_FLAGS_L);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid authorization");
+        return rc;
+    }
+
+    TPM2B_DIGEST cp_hash = { .size = 0 };
+    if (ctx.cp_hash_path && ctx.clear_lockout) {
+        LOG_WARN("Calculating cpHash. Exiting without resetting dictionary lockout");
+        tool_rc rc = tpm2_dictionarylockout_reset(ectx,
+        &ctx.auth_hierarchy.object, &cp_hash);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+        goto out;
+    }
+
+    if (ctx.cp_hash_path && ctx.setup_parameters) {
+        LOG_WARN("Calculating cpHash. Exiting without setting dictionary lockout");
+        tool_rc rc = tpm2_dictionarylockout_setup(ectx,
+        &ctx.auth_hierarchy.object, ctx.max_tries, ctx.recovery_time,
+        ctx.lockout_recovery_time, &cp_hash);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+        goto out;
+    }
 
     /*
      * If setup params and clear lockout are both required, clear lockout should
-     * preceed parameters setup.
+     * precede parameters setup.
      */
-    if (ctx->clear_lockout) {
+    if (ctx.clear_lockout) {
+        return tpm2_dictionarylockout_reset(ectx, &ctx.auth_hierarchy.object,
+        NULL);
+    }
 
-        LOG_INFO("Resetting dictionary lockout state.\n");
-        UINT32 rval = Tss2_Sys_DictionaryAttackLockReset(ctx->sapi_context,
-                TPM_RH_LOCKOUT, &sessionsData, &sessionsDataOut);
-        if (rval != TPM_RC_SUCCESS) {
-            LOG_ERR("0x%X Error clearing dictionary lockout.\n", rval);
-            return false;
+    if (ctx.setup_parameters) {
+        return tpm2_dictionarylockout_setup(ectx, &ctx.auth_hierarchy.object,
+        ctx.max_tries, ctx.recovery_time, ctx.lockout_recovery_time, NULL);
+    }
+
+out:
+    if (ctx.cp_hash_path) {
+        bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+        if (!result) {
+            rc = tool_rc_general_error;
         }
     }
-
-    if (ctx->setup_parameters) {
-        LOG_INFO("Setting up Dictionary Lockout parameters.\n");
-        UINT32 rval = Tss2_Sys_DictionaryAttackParameters(ctx->sapi_context,
-                TPM_RH_LOCKOUT, &sessionsData, ctx->max_tries,
-                ctx->recovery_time, ctx->lockout_recovery_time,
-                &sessionsDataOut);
-        if (rval != TPM_RC_SUCCESS) {
-            LOG_ERR(
-                    "0x%X Failed setting up dictionary_attack_lockout_reset params\n",
-                    rval);
-            return false;
-        }
-    }
-
-    return true;
+    return rc;
 }
 
-static bool init(int argc, char *argv[], dictionarylockout_ctx *ctx) {
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
 
-    struct option long_options[] = {
-        { "max-tries", required_argument, NULL, 'n' }, 
-        { "recovery-time", required_argument, NULL, 't' }, 
-        { "lockout-recovery-time", required_argument, NULL, 'l' }, 
-        { "lockout-passwd", required_argument, NULL, 'P' }, 
-        { "clear-lockout", no_argument, NULL, 'c' }, 
-        { "setup-parameters", no_argument, NULL, 's' },
-        { "input-session-handle",required_argument,NULL,'S'},
-        { NULL, no_argument, NULL, 0 }, 
-    };
-
-    int opt;
-    bool result;
-    while ((opt = getopt_long(argc, argv, "n:t:l:P:S:cs", long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'c':
-            ctx->clear_lockout = true;
-            break;
-        case 's':
-            ctx->setup_parameters = true;
-            break;
-        case 'P':
-            result = password_tpm2_util_copy_password(optarg, "Lockout Password",
-                    &ctx->lockout_passwd);
-            if (!result) {
-                return false;
-            }
-            ctx->use_passwd = true;
-            break;
-        case 'n':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->max_tries);
-            if (!result) {
-                LOG_ERR("Could not convert max_tries to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            if (ctx->max_tries == 0) {
-                LOG_ERR("max_tries cannot be 0");
-                return false;
-            }
-            break;
-        case 't':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->recovery_time);
-            if (!result) {
-                LOG_ERR(
-                        "Could not convert recovery_time to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            break;
-        case 'l':
-            result = tpm2_util_string_to_uint32(optarg,
-                    &ctx->lockout_recovery_time);
-            if (!result) {
-                LOG_ERR(
-                        "Could not convert lockout_recovery_time to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            break;
-        case 'S':
-             if (!tpm2_util_string_to_uint32(optarg, &ctx->auth_session_handle)) {
-                 LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                         optarg);
-                 return false;
-             }
-             ctx->is_session_based_auth = true;
-             break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
-        }
-    }
-
-    if (!ctx->clear_lockout && !ctx->setup_parameters) {
-        LOG_ERR( "Invalid operational input: Neither Setup nor Clear lockout requested.\n");
-        return false;
-    }
-
-    return true;
+    return tpm2_session_close(&ctx.auth_hierarchy.object.session);
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
-
-    (void) opts;
-    (void) envp;
-
-    if (argc == 1) {
-        showArgMismatch(argv[0]);
-        return -1;
-    }
-
-    dictionarylockout_ctx ctx = { 
-        .max_tries = 0, 
-        .recovery_time = 0,
-        .lockout_recovery_time = 0, 
-        .clear_lockout = false,
-        .setup_parameters = false, 
-        .use_passwd = true, 
-        .sapi_context = sapi_context
-    };
-
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        return 1;
-    }
-
-    result = dictionary_lockout_reset_and_parameter_setup(&ctx);
-    if (!result) {
-        return 1;
-    }
-
-    return 0;
-}
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("dictionarylockout", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

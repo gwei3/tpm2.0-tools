@@ -1,77 +1,46 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-
-#include <limits.h>
-#include <ctype.h>
-#include <getopt.h>
-
-#include <sapi/tpm20.h>
 
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
-#include "tpm_session.h"
+#include "tpm2.h"
+#include "tpm2_tool.h"
 
 typedef struct tpm_activatecred_ctx tpm_activatecred_ctx;
 struct tpm_activatecred_ctx {
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } credential_key; //Typically EK
 
     struct {
-        TPMI_DH_OBJECT activate;
-        TPMI_DH_OBJECT key;
-    } handle;
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } credentialed_key; //Typically AK
 
-    TPM2B_ID_OBJECT credentialBlob;
+    TPM2B_ID_OBJECT credential_blob;
     TPM2B_ENCRYPTED_SECRET secret;
-    bool hexPasswd;
-
-    TPMS_AUTH_COMMAND password;
-    TPMS_AUTH_COMMAND endorse_password;
+    const char *output_file;
 
     struct {
-        char *output;
-        char *context;
-        char *key_context;
-    } file ;
+        UINT8 i :1;
+        UINT8 o :1;
+    } flags;
+
+    char *cp_hash_path;
 };
 
-static bool read_cert_secret(const char *path, TPM2B_ID_OBJECT *credentialBlob,
+static tpm_activatecred_ctx ctx;
+
+static bool read_cert_secret(const char *path, TPM2B_ID_OBJECT *cred,
         TPM2B_ENCRYPTED_SECRET *secret) {
 
     bool result = false;
@@ -82,297 +51,203 @@ static bool read_cert_secret(const char *path, TPM2B_ID_OBJECT *credentialBlob,
         return false;
     }
 
-    size_t items = fread(credentialBlob, sizeof(TPM2B_ID_OBJECT), 1, fp);
-    if (items != 1) {
-        const char *fmt_msg =
-                "Reading credential from file \"%s\" failed, error: \"%s\"";
-        const char *err_msg = "Unknown error";
-        if (ferror(fp)) {
-            err_msg = strerror(errno);
-        } else if (feof(fp)) {
-            err_msg = "end of file";
-        }
-        LOG_ERR(fmt_msg, path, err_msg);
+    uint32_t version;
+    result = files_read_header(fp, &version);
+    if (!result) {
+        LOG_ERR("Could not read version header");
         goto out;
     }
 
-    items = fread(secret, sizeof(TPM2B_ENCRYPTED_SECRET), 1, fp);
-    if (items != 1) {
-        const char *fmt_msg =
-                "Reading secret from file \"%s\" failed, error: \"%s\"";
-        const char *err_msg = "Unknown error";
-        if (ferror(fp)) {
-            err_msg = strerror(errno);
-        } else if (feof(fp)) {
-            err_msg = "end of file";
-        }
-        LOG_ERR(fmt_msg, path, err_msg);
+    if (version != 1) {
+        LOG_ERR("Unknown credential format, got %"PRIu32" expected 1", version);
+        goto out;
+    }
+
+    result = files_read_16(fp, &cred->size);
+    if (!result) {
+        LOG_ERR("Could not read credential size");
+        goto out;
+    }
+
+    result = files_read_bytes(fp, cred->credential, cred->size);
+    if (!result) {
+        LOG_ERR("Could not read credential data");
+        goto out;
+    }
+
+    result = files_read_16(fp, &secret->size);
+    if (!result) {
+        LOG_ERR("Could not read secret size");
+        goto out;
+    }
+
+    result = files_read_bytes(fp, secret->secret, secret->size);
+    if (!result) {
+        LOG_ERR("Could not write secret data");
         goto out;
     }
 
     result = true;
-    out: fclose(fp);
 
+out:
+    fclose(fp);
     return result;
 }
 
 static bool output_and_save(TPM2B_DIGEST *digest, const char *path) {
 
-    printf("\nCertInfoData :\n");
+    tpm2_tool_output("certinfodata:");
 
     unsigned k;
-    for (k = 0; k < digest->t.size; k++) {
-        printf("0x%.2x ", digest->t.buffer[k]);
+    for (k = 0; k < digest->size; k++) {
+        tpm2_tool_output("%.2x", digest->buffer[k]);
     }
-    printf("\n\n");
+    tpm2_tool_output("\n");
 
-    return files_save_bytes_to_file(path, digest->t.buffer, digest->t.size);
+    return files_save_bytes_to_file(path, digest->buffer, digest->size);
 }
 
-static bool activate_credential_and_output(TSS2_SYS_CONTEXT *sapi_context,
-        tpm_activatecred_ctx *ctx) {
+static tool_rc activate_credential_and_output(ESYS_CONTEXT *ectx) {
 
-    TPM2B_DIGEST certInfoData = TPM2B_TYPE_INIT(TPM2B_DIGEST, buffer);
-    TPMS_AUTH_COMMAND tmp_auth = {
-            .nonce = { .t = { .size = 0 } },
-            .hmac =  { .t = { .size = 0 } },
-            .sessionHandle = 0,
-            .sessionAttributes = { .val = 0 },
-    };
+    tool_rc rc = tool_rc_general_error;
 
-    ctx->password.sessionHandle = TPM_RS_PW;
-    ctx->endorse_password.sessionHandle = TPM_RS_PW;
+    TPM2B_DIGEST *cert_info_data;
 
-    TPMS_AUTH_COMMAND *cmd_session_array_password[2] = {
-        &ctx->password,
-        &tmp_auth
-    };
+    if (ctx.cp_hash_path) {
+        TPM2B_DIGEST cp_hash = { .size = 0 };
+        rc = tpm2_activatecredential(ectx, &ctx.credentialed_key.object,
+            &ctx.credential_key.object, &ctx.credential_blob, &ctx.secret,
+            &cert_info_data, &cp_hash);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
 
-    TSS2_SYS_CMD_AUTHS cmd_auth_array_password = {
-        2, &cmd_session_array_password[0]
-    };
+        bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+        if (!result) {
+            rc = tool_rc_general_error;
+        }
+        return rc;
+    }
 
-    TPMS_AUTH_COMMAND *cmd_session_array_endorse[1] = {
-        &ctx->endorse_password
-    };
+    rc = tpm2_activatecredential(ectx, &ctx.credentialed_key.object,
+            &ctx.credential_key.object, &ctx.credential_blob, &ctx.secret,
+            &cert_info_data, NULL);
+    if (rc != tool_rc_success) {
+        goto out_all;
+    }
 
-    TSS2_SYS_CMD_AUTHS cmd_auth_array_endorse = {
-        1, &cmd_session_array_endorse[0]
-    };
-
-    TPM2B_ENCRYPTED_SECRET encryptedSalt = TPM2B_EMPTY_INIT;
-
-    TPM2B_NONCE nonceCaller = TPM2B_EMPTY_INIT;
-
-    TPMT_SYM_DEF symmetric = {
-        .algorithm = TPM_ALG_NULL
-    };
-
-    bool result = password_tpm2_util_to_auth(&ctx->password.hmac, ctx->hexPasswd,
-            "handlePasswd", &ctx->password.hmac);
+    bool result = output_and_save(cert_info_data, ctx.output_file);
     if (!result) {
-        return false;
+        goto out_all;
     }
 
-    result = password_tpm2_util_to_auth(&ctx->endorse_password.hmac, ctx->hexPasswd,
-            "endorsePasswd", &ctx->endorse_password.hmac);
-    if (!result) {
-        return false;
-    }
+    rc = tool_rc_success;
 
-    SESSION *session = NULL;
-    UINT32 rval = tpm_session_start_auth_with_params(sapi_context, &session,
-            TPM_RH_NULL, 0, TPM_RH_NULL, 0, &nonceCaller, &encryptedSalt,
-            TPM_SE_POLICY, &symmetric, TPM_ALG_SHA256);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("tpm_session_start_auth_with_params Error. TPM Error:0x%x",
-                rval);
-        return false;
-    }
-
-    rval = Tss2_Sys_PolicySecret(sapi_context, TPM_RH_ENDORSEMENT,
-            session->sessionHandle, &cmd_auth_array_endorse, 0, 0, 0, 0, 0, 0, 0);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("Tss2_Sys_PolicySecret Error. TPM Error:0x%x", rval);
-        return false;
-    }
-
-    tmp_auth.sessionHandle = session->sessionHandle;
-    tmp_auth.sessionAttributes.continueSession = 1;
-    tmp_auth.hmac.t.size = 0;
-
-    rval = Tss2_Sys_ActivateCredential(sapi_context, ctx->handle.activate,
-            ctx->handle.key, &cmd_auth_array_password, &ctx->credentialBlob, &ctx->secret,
-            &certInfoData, 0);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("ActivateCredential failed. TPM Error:0x%x", rval);
-        return false;
-    }
-
-    // Need to flush the session here.
-    rval = Tss2_Sys_FlushContext(sapi_context, session->sessionHandle);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("TPM2_Sys_FlushContext Error. TPM Error:0x%x", rval);
-        return false;
-    }
-
-    // And remove the session from sessions table.
-    rval = tpm_session_auth_end(session);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("EndAuthSession Error. TPM Error:0x%x", rval);
-        return false;
-    }
-
-    return output_and_save(&certInfoData, ctx->file.output);
+out_all:
+    free(cert_info_data);
+    return rc;
 }
 
-static bool init(int argc, char *argv[], tpm_activatecred_ctx *ctx) {
+static bool on_option(char key, char *value) {
 
-    static const char *optstring = "H:c:k:C:P:e:f:o:X";
-    static const struct option long_options[] = {
-        {"handle",        required_argument, NULL, 'H'},
-        {"context",       required_argument, NULL, 'c'},
-        {"keyHandle",     required_argument, NULL, 'k'},
-        {"keyContext",    required_argument, NULL, 'C'},
-        {"Password",      required_argument, NULL, 'P'},
-        {"endorsePasswd", required_argument, NULL, 'e'},
-        {"inFile",        required_argument, NULL, 'f'},
-        {"outFile",       required_argument, NULL, 'o'},
-        {"passwdInHex",   no_argument,       NULL, 'X'},
-        {NULL,            no_argument,       NULL,  '\0'},
-    };
-
-    if (argc == 1) {
-        showArgMismatch(argv[0]);
-        return false;
-    }
-
-    int H_flag = 0, c_flag = 0, k_flag = 0, C_flag = 0,
-            f_flag = 0, o_flag = 0;
-
-    int opt;
     bool result;
-    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'H':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->handle.activate);
-            if (!result) {
-                LOG_ERR("Could not convert -H argument to a number, "
-                        "got \"%s\"!", optarg);
-                return false;
-            }
-            H_flag = 1;
-            break;
-        case 'c':
-            ctx->file.context = optarg;
-            c_flag = 1;
-            break;
-        case 'k':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->handle.key);
-            if (!result) {
-                return false;
-            }
-            k_flag = 1;
-            break;
-        case 'C':
-            ctx->file.key_context = optarg;
-            C_flag = 1;
-            break;
-        case 'P':
-            ctx->password.hmac.t.size = sizeof(ctx->password.hmac.t) - 2;
-            result = password_tpm2_util_copy_password(optarg, "handle password",
-                    &ctx->password.hmac);
-            if (!result) {
-                return false;
-            }
-            //P_flag = 1;
-            break;
-        case 'e':
-            result = password_tpm2_util_copy_password(optarg, "endorse password",
-                    &ctx->endorse_password.hmac);
-            if (!result) {
-                return false;
-            }
-            break;
-        case 'f':
-            /* logs errors */
-            result = read_cert_secret(optarg, &ctx->credentialBlob,
-                    &ctx->secret);
-            if (!result) {
-                return false;
-            }
-            f_flag = 1;
-            break;
-        case 'o':
-            ctx->file.output = optarg;
-            o_flag = 1;
-            break;
-        case 'X':
-            ctx->hexPasswd = true;
-            break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
+
+    switch (key) {
+    case 'c':
+        ctx.credentialed_key.ctx_path = value;
+        break;
+    case 'p':
+        ctx.credentialed_key.auth_str = value;
+        break;
+    case 'C':
+        ctx.credential_key.ctx_path = value;
+        break;
+    case 'P':
+        ctx.credential_key.auth_str = value;
+        break;
+    case 'i':
+        /* logs errors */
+        result = read_cert_secret(value, &ctx.credential_blob, &ctx.secret);
+        if (!result) {
             return false;
         }
-    };
-
-    if ((!H_flag && !c_flag )
-            && (!k_flag || !C_flag) && !f_flag && !o_flag) {
-        showArgMismatch(argv[0]);
-        return false;
+        ctx.flags.i = 1;
+        break;
+    case 'o':
+        ctx.output_file = value;
+        ctx.flags.o = 1;
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
     }
 
     return true;
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
+static bool tpm2_tool_onstart(tpm2_options **opts) {
+
+    static const struct option topts[] = {
+         {"credentialedkey-context", required_argument, NULL, 'c'},
+         {"credentialkey-context",   required_argument, NULL, 'C'},
+         {"credentialedkey-auth",    required_argument, NULL, 'p'},
+         {"credentialkey-auth",      required_argument, NULL, 'P'},
+         {"credential-blob",         required_argument, NULL, 'i'},
+         {"certinfo-data",           required_argument, NULL, 'o'},
+         {"cphash",                  required_argument, NULL,  0 },
+    };
+
+    *opts = tpm2_options_new("c:C:p:P:i:o:", ARRAY_LEN(topts), topts, on_option,
+            NULL, 0);
+
+    return *opts != NULL;
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
 
     /* opts is unused, avoid compiler warning */
-    (void) opts;
-    (void) envp;
+    UNUSED(flags);
 
-    /*
-    * A bug in certain gcc versions prevents us from using = { 0 };
-    * https://gcc.gnu.org/bugzilla/show_bug.cgi?id=53119
-    *
-    * Declare it static since we don't need thread safety.
-    */
-    static tpm_activatecred_ctx ctx;
-
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        LOG_ERR("Initialization failed\n");
-        return 1;
+    if ((!ctx.credentialed_key.ctx_path) && (!ctx.credential_key.ctx_path)
+            && !ctx.flags.i && !ctx.flags.o) {
+        LOG_ERR("Expected options c and C and i and o.");
+        return tool_rc_option_error;
     }
 
-    if (ctx.file.context) {
-        bool res = file_load_tpm_context_from_file(sapi_context, &ctx.handle.activate,
-                ctx.file.context);
-        if (!res) {
-            return 1;
-        }
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.credential_key.ctx_path,
+            ctx.credential_key.auth_str, &ctx.credential_key.object, false,
+            TPM2_HANDLE_ALL_W_NV);
+    if (rc != tool_rc_success) {
+        return rc;
     }
 
-    if (ctx.file.key_context) {
-        bool res = file_load_tpm_context_from_file(sapi_context, &ctx.handle.key,
-                ctx.file.key_context) != true;
-        if (!res) {
-            return 1;
-        }
+    rc = tpm2_util_object_load_auth(ectx, ctx.credentialed_key.ctx_path,
+            ctx.credentialed_key.auth_str, &ctx.credentialed_key.object,
+            false, TPM2_HANDLE_ALL_W_NV);
+    if (rc != tool_rc_success) {
+        return rc;
     }
 
-    result = activate_credential_and_output(sapi_context, &ctx);
-    if (!result) {
-        return 1;
-    }
-
-    return 0;
+    return activate_credential_and_output(ectx);
 }
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+
+    tool_rc rc = tool_rc_success;
+
+    tool_rc tmp_rc = tpm2_session_close(&ctx.credentialed_key.object.session);
+    if (tmp_rc != tool_rc_success) {
+        rc = tmp_rc;
+    }
+
+    tmp_rc = tpm2_session_close(&ctx.credential_key.object.session);
+    if (tmp_rc != tool_rc_success) {
+        rc = tmp_rc;
+    }
+
+    return rc;
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("activatecredential", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

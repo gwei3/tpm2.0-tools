@@ -1,144 +1,252 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
+#include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#include <getopt.h>
-#include <limits.h>
-#include <sapi/tpm20.h>
-
-#include "log.h"
 #include "files.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
+#include "log.h"
+#include "tpm2.h"
+#include "tpm2_capability.h"
+#include "tpm2_tool.h"
 
 typedef struct tpm_random_ctx tpm_random_ctx;
 struct tpm_random_ctx {
-    bool output_file_specified;
     char *output_file;
     UINT16 num_of_bytes;
-    TSS2_SYS_CONTEXT *sapi_context;
+    bool force;
+    bool hex;
+    tpm2_session *audit_session;
+    const char *audit_session_path;
+    const char *cp_hash_path;
+    const char *rp_hash_path;
 };
 
-static bool get_random_and_save(tpm_random_ctx *ctx) {
+static tpm_random_ctx ctx;
 
-    TPM2B_DIGEST random_bytes = TPM2B_TYPE_INIT(TPM2B_DIGEST, buffer);
+static tool_rc get_random_and_save(ESYS_CONTEXT *ectx) {
 
-    TPM_RC rval = Tss2_Sys_GetRandom(ctx->sapi_context, NULL, ctx->num_of_bytes,
-            &random_bytes, NULL);
-    if (rval != TSS2_RC_SUCCESS) {
-        LOG_ERR("TPM2_GetRandom Error. TPM Error:0x%x", rval);
-        return false;
-    }
-
-    if (!ctx->output_file_specified) {
-        UINT16 i;
-        for (i = 0; i < random_bytes.t.size; i++) {
-            printf("%s0x%2.2X", i ? " " : "", random_bytes.t.buffer[i]);
+    ESYS_TR audit_session_handle = ESYS_TR_NONE;
+    TPMI_ALG_HASH param_hash_algorithm = TPM2_ALG_SHA256;
+    if (ctx.audit_session_path) {
+            tool_rc rc = tpm2_session_restore(ectx, ctx.audit_session_path,
+            false, &ctx.audit_session);
+        if (rc != tool_rc_success) {
+            LOG_ERR("Could not restore audit session");
+            return rc;
         }
-        printf("\n");
-        return true;
+        audit_session_handle = tpm2_session_get_handle(ctx.audit_session);
+        param_hash_algorithm = tpm2_session_get_authhash(ctx.audit_session);
     }
 
-    return files_save_bytes_to_file(ctx->output_file, (UINT8 *) random_bytes.t.buffer,
-            random_bytes.t.size);
+    TPM2B_DIGEST *cp_hash =
+        ctx.cp_hash_path ? calloc(1, sizeof(TPM2B_DIGEST)): NULL;
+    TPM2B_DIGEST *rp_hash =
+        ctx.rp_hash_path ? calloc(1, sizeof(TPM2B_DIGEST)) : NULL;
+    TPM2B_DIGEST *random_bytes;
+    tool_rc rc = tpm2_getrandom(ectx, ctx.num_of_bytes, &random_bytes,
+    cp_hash, rp_hash, audit_session_handle, param_hash_algorithm);
+    if (rc != tool_rc_success) {
+        goto out_skip_output_file;
+    }
+
+    if (ctx.cp_hash_path) {
+        bool result = files_save_digest(cp_hash, ctx.cp_hash_path);
+        if (!result) {
+            rc = tool_rc_general_error;
+        }
+        if (!ctx.rp_hash_path) {
+            goto out_skip_output_file;
+        }
+    }
+
+    /* ensure we got the expected number of bytes unless force is set */
+    if (!ctx.force && random_bytes->size != ctx.num_of_bytes) {
+        LOG_ERR("Got %"PRIu16" bytes, expected: %"PRIu16"\n"
+                "Lower your requested amount or"
+                " use --force to override this behavior",
+                random_bytes->size, ctx.num_of_bytes);
+        rc = tool_rc_general_error;
+        goto out_skip_output_file;
+    }
+
+    /*
+     * Either open an output file, or if stdout, do nothing as -Q
+     * was specified.
+     */
+    FILE *out = stdout;
+    if (ctx.output_file) {
+        out = fopen(ctx.output_file, "wb+");
+        if (!out) {
+            LOG_ERR("Could not open output file \"%s\", error: %s",
+                    ctx.output_file, strerror(errno));
+            rc = tool_rc_general_error;
+            goto out;
+        }
+    } else if (!output_enabled) {
+        goto out;
+    }
+
+    if (ctx.hex) {
+        tpm2_util_print_tpm2b2(out, random_bytes);
+        goto out;
+    }
+
+    bool result = files_write_bytes(out, random_bytes->buffer,
+    random_bytes->size);
+    if (!result) {
+        rc = tool_rc_general_error;
+        goto out;
+    }
+
+    if (ctx.rp_hash_path) {
+        bool result = files_save_digest(rp_hash, ctx.rp_hash_path);
+        rc = result ? tool_rc_success : tool_rc_general_error;
+    }
+
+out:
+    if (out && out != stdout) {
+        fclose(out);
+    }
+
+out_skip_output_file:
+    if (ctx.rp_hash_path || !ctx.cp_hash_path) {
+        free(random_bytes);
+    }
+    free(cp_hash);
+    free(rp_hash);
+
+    return rc;
 }
 
-#define ARG_CNT (2 * (sizeof(long_options)/sizeof(long_options[0]) - 1))
+static bool on_option(char key, char *value) {
 
-static bool init(int argc, char *argv[], tpm_random_ctx *ctx) {
+    UNUSED(key);
 
-    static const char *short_options = "o:";
-    static const struct option long_options[] = {
-        { "output",   required_argument, NULL, 'o' },
-        { NULL,   no_argument,       NULL,  '\0' },
-    };
-
-    if (argc !=2 && argc != 4) {
-        showArgMismatch(argv[0]);
-        return false;
+    switch (key) {
+    case 'f':
+        ctx.force = true;
+        break;
+    case 'o':
+        ctx.output_file = value;
+        break;
+    case 0:
+        ctx.hex = true;
+        break;
+    case 1:
+        ctx.cp_hash_path = value;
+        break;
+    case 2:
+        ctx.rp_hash_path = value;
+        break;
+    case 'S':
+        ctx.audit_session_path = value;
+        break;
+        /* no default */
     }
 
-    int opt;
-    while ((opt = getopt_long(argc, argv, short_options, long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'o':
-            ctx->output_file_specified = true;
-            ctx->output_file = optarg;
-            break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
+    return true;
+}
+
+static tool_rc get_max_random(ESYS_CONTEXT *ectx, UINT32 *value) {
+
+    TPMS_CAPABILITY_DATA *cap_data = NULL;
+    tool_rc rc = tpm2_capability_get(ectx, TPM2_CAP_TPM_PROPERTIES,
+            TPM2_PT_FIXED, TPM2_MAX_TPM_PROPERTIES, &cap_data);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    UINT32 i;
+    for (i = 0; i < cap_data->data.tpmProperties.count; i++) {
+        TPMS_TAGGED_PROPERTY *p = &cap_data->data.tpmProperties.tpmProperty[i];
+        if (p->property == TPM2_PT_MAX_DIGEST) {
+            *value = p->value;
+            free(cap_data);
+            return tool_rc_success;
         }
     }
 
-    bool result = tpm2_util_string_to_uint16(argv[optind], &ctx->num_of_bytes);
+    LOG_ERR("TPM does not have property TPM2_PT_MAX_DIGEST");
+    free(cap_data);
+    return tool_rc_general_error;
+}
+
+static bool on_args(int argc, char **argv) {
+
+    if (argc > 1) {
+        LOG_ERR("Only supports one SIZE octets, got: %d", argc);
+        return false;
+    }
+
+    bool result = tpm2_util_string_to_uint16(argv[0], &ctx.num_of_bytes);
     if (!result) {
-        LOG_ERR("Error converting size to a number, got: \"%s\".",
-                argv[optind]);
+        LOG_ERR("Error converting size to a number, got: \"%s\".", argv[0]);
         return false;
     }
 
     return true;
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-            TSS2_SYS_CONTEXT *sapi_context) {
+static bool tpm2_tool_onstart(tpm2_options **opts) {
 
-    (void)opts;
-    (void)envp;
-
-    tpm_random_ctx ctx = {
-            .output_file_specified = false,
-            .num_of_bytes = 0,
-            .output_file = NULL,
-            .sapi_context = sapi_context
+    const struct option topts[] = {
+        { "output",       required_argument, NULL, 'o' },
+        { "force",        required_argument, NULL, 'f' },
+        { "hex",          no_argument,       NULL,  0  },
+        { "session",      required_argument, NULL, 'S' },
+        { "cphash",       required_argument, NULL,  1  },
+        { "rphash",       required_argument, NULL,  2  }
     };
 
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        return 1;
+    *opts = tpm2_options_new("S:o:f", ARRAY_LEN(topts), topts, on_option, on_args,
+            0);
+
+    return *opts != NULL;
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    /*
+     * Error if bytes requested is bigger than max hash size, which is what TPMs
+     * should bound their requests by and always have available per the spec.
+     *
+     * Per 16.1 of:
+     *  - https://trustedcomputinggroup.org/wp-content/uploads/TPM-Rev-2.0-Part-3-Commands-01.38.pdf
+     *
+     *  Allow the force flag to override this behavior.
+     */
+    if (!ctx.force) {
+        UINT32 max = 0;
+        tool_rc rc = get_max_random(ectx, &max);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+
+        if (ctx.num_of_bytes > max) {
+            LOG_ERR("TPM getrandom is bounded by max hash size, which is: "
+                    "%"PRIu32"\n"
+                    "Please lower your request (preferred) and try again or"
+                    " use --force (advanced)", max);
+            return tool_rc_general_error;
+        }
     }
 
-    return get_random_and_save(&ctx) != true;
+    return get_random_and_save(ectx);
 }
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+    if (ctx.audit_session_path) {
+        return tpm2_session_close(&ctx.audit_session);
+    }
+    return tool_rc_success;
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("getrandom", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

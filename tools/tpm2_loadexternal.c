@@ -1,219 +1,361 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
-#include <limits.h>
-#include <stdbool.h>
+#include <assert.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 
-#include <getopt.h>
-#include <sapi/tpm20.h>
+#include <openssl/rand.h>
 
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "tpm2_util.h"
+#include "tpm2.h"
+#include "tpm2_alg_util.h"
+#include "tpm2_attr_util.h"
+#include "tpm2_auth_util.h"
+#include "tpm2_hierarchy.h"
+#include "tpm2_openssl.h"
+#include "tpm2_tool.h"
+
+#define BASE_DEFAULT_ATTRS \
+    (TPMA_OBJECT_DECRYPT | TPMA_OBJECT_SIGN_ENCRYPT)
+
+#define DEFAULT_NAME_ALG TPM2_ALG_SHA256
 
 typedef struct tpm_loadexternal_ctx tpm_loadexternal_ctx;
 struct tpm_loadexternal_ctx {
     char *context_file_path;
     TPMI_RH_HIERARCHY hierarchy_value;
-    TPM_HANDLE rsa2048_handle;
-    TPM2B_PUBLIC public_key;
-    TPM2B_SENSITIVE private_key;
-    bool has_private_key;
-    bool save_to_context_file;
-    TSS2_SYS_CONTEXT *sapi_context;
+    ESYS_TR handle;
+    char *public_key_path; /* path to the public portion of an object */
+    char *private_key_path; /* path to the private portion of an object */
+    char *attrs; /* The attributes to use */
+    char *auth; /* The password for use of the private portion */
+    char *policy; /* a policy for use of the private portion */
+    char *name_alg; /* name hashing algorithm */
+    char *key_type; /* type of key attempting to load, defaults to an auto attempt */
+    char *name_path; /* An optional path to output the loaded objects name information to */
+    char *passin; /* an optional auth string for the input key file for OSSL */
 };
 
-static bool get_hierarchy_value(const char *argument_opt,
-        TPMI_RH_HIERARCHY *hierarchy_value) {
+static tpm_loadexternal_ctx ctx = {
+    /*
+     * default to the NULL hierarchy, as the tpm rejects loading a private
+     * portion of an object in other hierarchies.
+     */
+    .hierarchy_value = TPM2_RH_NULL,
+};
 
-    if (strlen(argument_opt) != 1) {
-        LOG_ERR("Wrong Hierarchy Value, got: \"%s\", expected one of e,o,p,n",
-                argument_opt);
-        return false;
+static tool_rc load_external(ESYS_CONTEXT *ectx, TPM2B_PUBLIC *pub,
+        TPM2B_SENSITIVE *priv, bool has_priv, TPM2B_NAME **name) {
+
+    uint32_t hierarchy;
+    TSS2_RC rval = fix_esys_hierarchy(ctx.hierarchy_value, &hierarchy);
+    if (rval != TSS2_RC_SUCCESS) {
+        LOG_ERR("Unknown hierarchy");
+        return tool_rc_from_tpm(rval);
     }
 
-    switch (argument_opt[0]) {
-    case 'e':
-        *hierarchy_value = TPM_RH_ENDORSEMENT;
+    tool_rc rc = tpm2_loadexternal(ectx,
+            has_priv ? priv : NULL, pub,
+            hierarchy, &ctx.handle);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    return tpm2_tr_get_name(ectx, ctx.handle, name);
+}
+
+static bool on_option(char key, char *value) {
+
+    bool result;
+
+    switch (key) {
+    case 'C':
+        result = tpm2_util_handle_from_optarg(value, &ctx.hierarchy_value,
+                TPM2_HANDLE_FLAGS_ALL_HIERACHIES);
+        if (!result) {
+            return false;
+        }
         break;
-    case 'o':
-        *hierarchy_value = TPM_RH_OWNER;
+    case 'u':
+        ctx.public_key_path = value;
+        break;
+    case 'r':
+        ctx.private_key_path = value;
+        break;
+    case 'c':
+        ctx.context_file_path = value;
+        break;
+    case 'a':
+        ctx.attrs = value;
         break;
     case 'p':
-        *hierarchy_value = TPM_RH_PLATFORM;
+        ctx.auth = value;
+        break;
+    case 'L':
+        ctx.policy = value;
+        break;
+    case 'g':
+        ctx.name_alg = value;
+        break;
+    case 'G':
+        ctx.key_type = value;
         break;
     case 'n':
-        *hierarchy_value = TPM_RH_NULL;
+        ctx.name_path = value;
         break;
-    default:
-        LOG_ERR("Wrong Hierarchy Value, got: \"%s\", expected one of e,o,p,n",
-                argument_opt);
-        return false;
+    case 0:
+        ctx.passin = value;
+        break;
     }
 
     return true;
 }
 
-static bool load_external(tpm_loadexternal_ctx *ctx) {
+static bool tpm2_tool_onstart(tpm2_options **opts) {
 
-    TSS2_SYS_RSP_AUTHS sessionsDataOut;
-    TPMS_AUTH_RESPONSE *sessionDataOutArray[1];
-
-    TPM2B_NAME nameExt = TPM2B_TYPE_INIT(TPM2B_NAME, name);
-
-    sessionsDataOut.rspAuths = &sessionDataOutArray[0];
-    sessionsDataOut.rspAuthsCount = 1;
-
-    TPM_RC rval = Tss2_Sys_LoadExternal(ctx->sapi_context, 0,
-            ctx->has_private_key ? &ctx->private_key : NULL, &ctx->public_key,
-            ctx->hierarchy_value, &ctx->rsa2048_handle, &nameExt,
-            &sessionsDataOut);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("LoadExternal Failed ! ErrorCode: 0x%0x", rval);
-        return false;
-    }
-
-    return true;
-}
-
-static bool init(int argc, char *argv[], tpm_loadexternal_ctx *ctx) {
-
-    const char *optstring = "H:u:r:C:";
-    static struct option long_options[] = {
-      { "Hierachy", required_argument, NULL, 'H'},
-      { "pubfile",  required_argument, NULL, 'u'},
-      { "privfile", required_argument, NULL, 'r'},
-      { "context",  required_argument, NULL, 'C'},
-      { NULL,       no_argument,       NULL, '\0' }
+    const struct option topts[] = {
+      { "hierarchy",      required_argument, NULL, 'C'},
+      { "public",         required_argument, NULL, 'u'},
+      { "private",        required_argument, NULL, 'r'},
+      { "key-context",    required_argument, NULL, 'c'},
+      { "attributes",     required_argument, NULL, 'a'},
+      { "policy",         required_argument, NULL, 'L'},
+      { "auth",           required_argument, NULL, 'p'},
+      { "hash-algorithm", required_argument, NULL, 'g'},
+      { "key-algorithm",  required_argument, NULL, 'G'},
+      { "name",           required_argument, NULL, 'n'},
+      { "passin",         required_argument, NULL,  0 },
     };
 
-    union {
-        struct {
-            UINT8 H : 1;
-            UINT8 u : 1;
-            UINT8 unused : 6;
-        };
-        UINT8 all;
-    } flags = { .all = 0 };
+    *opts = tpm2_options_new("C:u:r:c:a:p:L:g:G:n:", ARRAY_LEN(topts), topts,
+            on_option, NULL, 0);
 
-    if(argc == 1) {
-        showArgMismatch(argv[0]);
-        return false;
+    return *opts != NULL;
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    if (!ctx.public_key_path && !ctx.private_key_path) {
+        LOG_ERR("Expected either -r or -u options");
+        return tool_rc_option_error;
     }
 
-    int opt = -1;
-    while((opt = getopt_long(argc,argv,optstring,long_options,NULL)) != -1)
-    {
-        switch(opt)
-        {
-        case 'H': {
-            bool result = get_hierarchy_value(optarg, &ctx->hierarchy_value);
-            if (!result) {
-                return false;
-            }
-        }
-        flags.H = 1;
-        break;
-        case 'u': {
-            UINT16 size = sizeof(ctx->public_key);
-            bool result = files_load_bytes_from_file(optarg, (UINT8 *)&ctx->public_key, &size);
-            if (!result) {
-                return false;
-            }
-            flags.u = 1;
-        } break;
-        case 'r': {
-            UINT16 size = sizeof(ctx->private_key);
-            bool result = files_load_bytes_from_file(optarg, (UINT8 *)&ctx->private_key, &size);
-            if (!result) {
-                return false;
-            }
-            ctx->has_private_key = true;
-        } break;
-        case 'C':
-            ctx->context_file_path = optarg;
-            ctx->save_to_context_file = true;
-            break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
+    if (!ctx.context_file_path) {
+        LOG_ERR("Expected -c option");
+        return tool_rc_option_error;
+    }
+
+    /*
+     * We only load a TSS format for the public portion, so if
+     * someone hands us a public file, we'll assume the TSS format when
+     * no -G is specified.
+     *
+     * If they specify a private they need to tell us the type we expect.
+     * This helps reduce auto-guess complexity, as well as future proofing
+     * us for being able to load XOR. Ie we don't want to guess XOR or HMAC
+     * in leui of AES or vice versa.
+     */
+    if (!ctx.key_type && ctx.private_key_path) {
+        LOG_ERR("Expected key type via -G option when specifying private"
+                " portion of object");
+        return tool_rc_option_error;
+    }
+
+    TPMI_ALG_PUBLIC alg = TPM2_ALG_NULL;
+
+    if (ctx.key_type) {
+        alg = tpm2_alg_util_from_optarg(ctx.key_type,
+                tpm2_alg_util_flags_asymmetric | tpm2_alg_util_flags_symmetric);
+        if (alg == TPM2_ALG_ERROR) {
+            LOG_ERR("Unsupported key type, got: \"%s\"", ctx.key_type);
+            return tool_rc_general_error;
         }
     }
 
-    if (!(flags.H && flags.u)) {
-        LOG_ERR("Expected H and u options");
-        return false;
-    }
-
-    return true;
-}
-
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
-
-    /* opts and envp are unused, avoid compiler warning */
-    (void)opts;
-    (void) envp;
-
-    tpm_loadexternal_ctx ctx = {
-            .has_private_key = false,
-            .save_to_context_file = false,
-            .sapi_context = sapi_context
+    /*
+     * Modifying this init to anything NOT 0 requires
+     * the memset/reinit on the case of specified -u
+     * and found public data in private.
+     */
+    TPM2B_PUBLIC pub = {
+        . size = 0,
+        .publicArea = {
+            .authPolicy = { .size = 0 },
+        },
     };
 
-    bool result = init(argc, argv, &ctx);
-    if(!result) {
-        return 1;
+    /*
+     * set up the public attributes with a default.
+     * This can be cleared by load_public() if a TSS
+     * object is provided.
+     */
+    if (ctx.attrs) {
+        bool result = tpm2_attr_util_obj_from_optarg(ctx.attrs,
+                &pub.publicArea.objectAttributes);
+        if (!result) {
+            return tool_rc_general_error;
+        }
+    } else {
+        /*
+         * Default to the BASE attributes, but add in USER_WITH_AUTH if -p is specified
+         * or NO -L. Where -L is a specified policy and -p is a specified password.
+         * Truth Table:
+         * -L -p | Result
+         * --------------
+         *  0  0 | 1 (set USER_WITH_AUTH)
+         *  0  1 | 0 (don't set USER_WITH_AUTH) <-- we want this case.
+         *  1  0 | 1
+         *  1  1 | 1
+         *
+         * This is an if/then truth table, we want to execute setting USER_WITH_AUTH on
+         * it's negation.
+         */
+        pub.publicArea.objectAttributes = BASE_DEFAULT_ATTRS;
+        if (!(ctx.policy && !ctx.auth)) {
+            pub.publicArea.objectAttributes |= TPMA_OBJECT_USERWITHAUTH;
+        }
     }
 
-    result = load_external(&ctx);
-    if (!result) {
-        return false;
+    /*
+     * Set the policy for public, again this can be overridden if the
+     * object is a TSS object
+     */
+    if (ctx.policy) {
+        pub.publicArea.authPolicy.size =
+                sizeof(pub.publicArea.authPolicy.buffer);
+        bool res = files_load_bytes_from_path(ctx.policy,
+                pub.publicArea.authPolicy.buffer,
+                &pub.publicArea.authPolicy.size);
+        if (!res) {
+            return tool_rc_general_error;
+        }
     }
 
-    if(ctx.save_to_context_file) {
-            return files_save_tpm_context_to_file(ctx.sapi_context, ctx.rsa2048_handle,
-                    ctx.context_file_path) != true;
+    /*
+     * Set the name alg, again this gets wipped on a TSS object
+     */
+    pub.publicArea.nameAlg =
+        ctx.name_alg ?
+                    tpm2_alg_util_from_optarg(ctx.name_alg,
+                            tpm2_alg_util_flags_hash
+                                    | tpm2_alg_util_flags_misc) :
+                    DEFAULT_NAME_ALG;
+    if (pub.publicArea.nameAlg == TPM2_ALG_ERROR) {
+        LOG_ERR("Invalid name hashing algorithm, got: \"%s\"", ctx.name_alg);
+        return tool_rc_general_error;
     }
 
-    return 0;
+    /*
+     * Set the AUTH value for sensitive portion
+     */
+    TPM2B_SENSITIVE priv = {
+        .size = 0,
+        .sensitiveArea = {
+            .authValue = { .size = 0 }
+        },
+    };
+    /*
+     * when nameAlg is not TPM2_ALG_NULL, seed value is needed to pass
+     * consistency checks by TPM
+     */
+    TPM2B_DIGEST *seed = &priv.sensitiveArea.seedValue;
+    seed->size = tpm2_alg_util_get_hash_size(pub.publicArea.nameAlg);
+    if (seed->size != 0) {
+        RAND_bytes(seed->buffer, seed->size);
+    }
+
+    tpm2_session *tmp;
+    tool_rc tmp_rc = tpm2_auth_util_from_optarg(NULL, ctx.auth, &tmp, true);
+    if (tmp_rc != tool_rc_success) {
+        LOG_ERR("Invalid key authorization");
+        return tmp_rc;
+    }
+
+    const TPM2B_AUTH *auth = tpm2_session_get_auth_value(tmp);
+    priv.sensitiveArea.authValue = *auth;
+
+    tpm2_session_close(&tmp);
+
+    tpm2_openssl_load_rc load_status = lprc_error;
+    if (ctx.private_key_path) {
+        load_status = tpm2_openssl_load_private(ctx.private_key_path,
+                ctx.passin, alg, &pub, &priv);
+        if (load_status == lprc_error) {
+            return tool_rc_general_error;
+        }
+    }
+
+    /*
+     * If we cannot load the public from the private and a path
+     * is not specified for public, this is an error.
+     *
+     * If we loaded the public from the private and a public was
+     * specified, this is warning. re-init public and load the
+     * specified one.
+     */
+    if (!tpm2_openssl_did_load_public(load_status) && !ctx.public_key_path) {
+        LOG_ERR("Only loaded a private key, expected public key in either"
+                " private PEM or -r option");
+        return tool_rc_general_error;
+
+    } else if (tpm2_openssl_did_load_public(load_status)
+            && ctx.public_key_path) {
+        LOG_WARN("Loaded a public key from the private portion"
+                " and a public portion was specified via -u. Defaulting"
+                " to specified public");
+
+        memset(&pub.publicArea.parameters, 0,
+                sizeof(pub.publicArea.parameters));
+        pub.publicArea.type = TPM2_ALG_NULL;
+    }
+
+    if (ctx.public_key_path) {
+        bool result = tpm2_openssl_load_public(ctx.public_key_path, alg, &pub);
+        if (!result) {
+            return tool_rc_general_error;
+        }
+    }
+
+    tool_rc rc = tool_rc_general_error;
+    TPM2B_NAME *name = NULL;
+    tmp_rc = load_external(ectx, &pub, &priv, ctx.private_key_path != NULL,
+            &name);
+    if (tmp_rc != tool_rc_success) {
+        rc = tmp_rc;
+        goto out;
+    }
+
+    assert(name);
+
+    tmp_rc = files_save_tpm_context_to_path(ectx, ctx.handle,
+            ctx.context_file_path);
+    if (tmp_rc != tool_rc_success) {
+        rc = tmp_rc;
+        goto out;
+    }
+
+    tpm2_tool_output("name: ");
+    tpm2_util_hexdump(name->name, name->size);
+    tpm2_tool_output("\n");
+
+    if (ctx.name_path) {
+        bool result = files_save_bytes_to_file(ctx.name_path, name->name,
+                name->size);
+        if (!result) {
+            goto out;
+        }
+    }
+
+    rc = tool_rc_success;
+
+out:
+    free(name);
+
+    return rc;
 }
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("loadexternal", tpm2_tool_onstart, tpm2_tool_onrun, NULL, NULL)

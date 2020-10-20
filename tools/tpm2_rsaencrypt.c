@@ -1,198 +1,138 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
-#include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-
-#include <getopt.h>
-#include <sapi/tpm20.h>
 
 #include "files.h"
 #include "log.h"
-#include "main.h"
-#include "options.h"
-#include "tpm2_util.h"
+#include "object.h"
+#include "tpm2.h"
+#include "tpm2_tool.h"
+#include "tpm2_alg_util.h"
+#include "tpm2_options.h"
 
 typedef struct tpm_rsaencrypt_ctx tpm_rsaencrypt_ctx;
 struct tpm_rsaencrypt_ctx {
-    TPMI_DH_OBJECT key_handle;
+    const char *context_arg;
+    tpm2_loaded_object key_context;
     TPM2B_PUBLIC_KEY_RSA message;
-    char *output_file_path;
-    TSS2_SYS_CONTEXT *sapi_context;
-};
-
-static bool rsa_encrypt_and_save(tpm_rsaencrypt_ctx *ctx) {
-
-    // Inputs
+    char *output_path;
+    char *input_path;
     TPMT_RSA_DECRYPT scheme;
     TPM2B_DATA label;
-    // Outputs
-    TPM2B_PUBLIC_KEY_RSA out_data = TPM2B_TYPE_INIT(TPM2B_PUBLIC_KEY_RSA, buffer);
+};
 
-    TPMS_AUTH_RESPONSE out_session_data;
-    TSS2_SYS_RSP_AUTHS out_sessions_data;
-    TPMS_AUTH_RESPONSE *out_session_data_array[1];
+static tpm_rsaencrypt_ctx ctx = {
+    .context_arg = NULL,
+    .scheme = { .scheme = TPM2_ALG_RSAES }
+};
 
-    out_session_data_array[0] = &out_session_data;
-    out_sessions_data.rspAuths = &out_session_data_array[0];
-    out_sessions_data.rspAuthsCount = 1;
+static tool_rc rsa_encrypt_and_save(ESYS_CONTEXT *context) {
 
-    scheme.scheme = TPM_ALG_RSAES;
-    label.t.size = 0;
+    bool ret = false;
+    TPM2B_PUBLIC_KEY_RSA *out_data = NULL;
 
-    TPM_RC rval = Tss2_Sys_RSA_Encrypt(ctx->sapi_context, ctx->key_handle, NULL,
-            &ctx->message, &scheme, &label, &out_data, &out_sessions_data);
-    if (rval != TPM_RC_SUCCESS) {
-        LOG_ERR("RSA_Encrypt failed, error code: 0x%x", rval);
-        return false;
+    tool_rc rc = tpm2_rsa_encrypt(context, &ctx.key_context,
+            &ctx.message, &ctx.scheme, &ctx.label, &out_data);
+    if (rc != tool_rc_success) {
+        return rc;
     }
 
-    return files_save_bytes_to_file(ctx->output_file_path, out_data.t.buffer,
-            out_data.t.size);
+    FILE *f = ctx.output_path ? fopen(ctx.output_path, "wb+") : stdout;
+    if (!f) {
+        goto out;
+    }
+
+    ret = files_write_bytes(f, out_data->buffer, out_data->size);
+    if (f != stdout) {
+        fclose(f);
+    }
+
+out:
+    free(out_data);
+    return ret ? tool_rc_success : tool_rc_general_error;
 }
 
-static bool init(int argc, char *argv[], tpm_rsaencrypt_ctx *ctx) {
+static bool on_option(char key, char *value) {
 
-    const char *optstring = "k:I:o:c:";
-    static struct option long_options[] = {
-      {"keyHandle",  required_argument, NULL, 'k'},
-      {"inFile",     required_argument, NULL, 'I'},
-      {"outFile",    required_argument, NULL, 'o'},
-      {"keyContext", required_argument, NULL, 'c'},
-      { NULL,        no_argument,       NULL, '\0'}
-    };
+    switch (key) {
+    case 'c':
+        ctx.context_arg = value;
+        break;
+    case 'o':
+        ctx.output_path = value;
+        break;
+    case 's':
+        ctx.scheme.scheme = tpm2_alg_util_from_optarg(value,
+                tpm2_alg_util_flags_rsa_scheme);
+        if (ctx.scheme.scheme == TPM2_ALG_ERROR) {
+            return false;
+        }
+        ctx.scheme.details.oaep.hashAlg = ctx.scheme.scheme == TPM2_ALG_OAEP ?
+            TPM2_ALG_SHA256 : 0;
+        break;
+    case 'l':
+        return tpm2_util_get_label(value, &ctx.label);
+    }
+    return true;
+}
 
-    if(argc == 1) {
-        showArgMismatch(argv[0]);
+static bool on_args(int argc, char **argv) {
+
+    if (argc > 1) {
+        LOG_ERR("Only supports one input file, got: %d", argc);
         return false;
     }
 
-    union {
-        struct {
-            UINT8 k : 1;
-            UINT8 I : 1;
-            UINT8 o : 1;
-            UINT8 c : 1;
-            UINT8 unused : 4;
-        };
-        UINT8 all;
-    } flags = { .all = 0 };
-
-    int opt;
-    char *context_key_file = NULL;
-    while ((opt = getopt_long(argc, argv, optstring, long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'k': {
-            bool result = tpm2_util_string_to_uint32(optarg, &ctx->key_handle);
-            if (!result) {
-                LOG_ERR("Could not convert key handle to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-            flags.k = 1;
-        }
-            break;
-        case 'I': {
-            ctx->message.t.size = sizeof(ctx->message) - 2;
-            bool result = files_load_bytes_from_file(optarg, ctx->message.t.buffer,
-                    &ctx->message.t.size);
-            if (!result) {
-                return false;
-            }
-            flags.I = 1;
-        }
-            break;
-        case 'o': {
-            bool result = files_does_file_exist(optarg);
-            if (result) {
-                return false;
-            }
-            ctx->output_file_path = optarg;
-            flags.o = 1;
-        }
-            break;
-        case 'c':
-            context_key_file = optarg;
-            flags.c = 1;
-            break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
-        }
-    };
-
-    if (!((flags.k || flags.c) && flags.I && flags.o)) {
-        LOG_ERR("Expected options I and o and (k or c)");
-        return false;
-    }
-
-    if (flags.c) {
-        bool result = file_load_tpm_context_from_file(ctx->sapi_context, &ctx->key_handle,
-                context_key_file);
-        if (!result) {
-            return false;
-        }
-    }
+    ctx.input_path = argv[0];
 
     return true;
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
+static bool tpm2_tool_onstart(tpm2_options **opts) {
 
-    /* opts and envp are unused, avoid compiler warning */
-    (void)opts;
-    (void) envp;
-
-    tpm_rsaencrypt_ctx ctx = {
-            .key_handle = 0,
-            .message = TPM2B_EMPTY_INIT,
-            .output_file_path = NULL,
-            .sapi_context = sapi_context
+    static const struct option topts[] = {
+      {"output",      required_argument, NULL, 'o'},
+      {"key-context", required_argument, NULL, 'c'},
+      {"scheme",      required_argument, NULL, 's'},
+      {"label",       required_argument, NULL, 'l'},
     };
 
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        return 1;
+    *opts = tpm2_options_new("o:c:s:l:", ARRAY_LEN(topts), topts, on_option,
+            on_args, 0);
+
+    return *opts != NULL;
+}
+
+static tool_rc init(ESYS_CONTEXT *context) {
+
+    if (!ctx.context_arg) {
+        LOG_ERR("Expected option c");
+        return tool_rc_option_error;
     }
 
-    return rsa_encrypt_and_save(&ctx) != true;
+    ctx.message.size = BUFFER_SIZE(TPM2B_PUBLIC_KEY_RSA, buffer);
+    bool result = files_load_bytes_from_buffer_or_file_or_stdin(NULL,
+            ctx.input_path, &ctx.message.size, ctx.message.buffer);
+    if (!result) {
+        return tool_rc_general_error;
+    }
+
+    return tpm2_util_object_load(context, ctx.context_arg, &ctx.key_context,
+            TPM2_HANDLE_ALL_W_NV);
 }
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *context, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    tool_rc rc = init(context);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    return rsa_encrypt_and_save(context);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("rsaencrypt", tpm2_tool_onstart, tpm2_tool_onrun, NULL, NULL)

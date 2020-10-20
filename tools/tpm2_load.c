@@ -1,292 +1,200 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
-
-#include <stdarg.h>
+/* SPDX-License-Identifier: BSD-3-Clause */
 
 #include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <limits.h>
-#include <ctype.h>
-#include <getopt.h>
-#include <stdbool.h>
 
-#include <sapi/tpm20.h>
-
-#include "log.h"
-#include "tpm2_util.h"
-#include "password_util.h"
 #include "files.h"
-#include "main.h"
-#include "options.h"
+#include "log.h"
+#include "tpm2.h"
+#include "tpm2_options.h"
+#include "tpm2_tool.h"
 
-TPM_HANDLE handle2048rsa;
-TPMS_AUTH_COMMAND sessionData = {
-        .sessionHandle = TPM_RS_PW,
-        .nonce = TPM2B_EMPTY_INIT,
-        .hmac = TPM2B_EMPTY_INIT,
-        .sessionAttributes = SESSION_ATTRIBUTES_INIT(0),
+typedef struct tpm_load_ctx tpm_load_ctx;
+struct tpm_load_ctx {
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } parent;
+
+    struct {
+        const char *pubpath;
+        TPM2B_PUBLIC public;
+        const char *privpath;
+        TPM2B_PRIVATE private;
+        ESYS_TR handle;
+    } object;
+
+    const char *namepath;
+    const char *contextpath;
+    char *cp_hash_path;
 };
-bool hexPasswd = false;
 
-int
-load (TSS2_SYS_CONTEXT *sapi_context,
-      TPMI_DH_OBJECT    parentHandle,
-      TPM2B_PUBLIC     *inPublic,
-      TPM2B_PRIVATE    *inPrivate,
-      const char       *outFileName)
-{
-    UINT32 rval;
-    TPMS_AUTH_RESPONSE sessionDataOut;
-    TSS2_SYS_CMD_AUTHS sessionsData;
-    TSS2_SYS_RSP_AUTHS sessionsDataOut;
-    TPMS_AUTH_COMMAND *sessionDataArray[1];
-    TPMS_AUTH_RESPONSE *sessionDataOutArray[1];
+static tpm_load_ctx ctx;
 
-    TPM2B_NAME nameExt = TPM2B_TYPE_INIT(TPM2B_NAME, name);
+static bool on_option(char key, char *value) {
 
-    sessionDataArray[0] = &sessionData;
-    sessionDataOutArray[0] = &sessionDataOut;
-
-    sessionsDataOut.rspAuths = &sessionDataOutArray[0];
-    sessionsData.cmdAuths = &sessionDataArray[0];
-
-    sessionsDataOut.rspAuthsCount = 1;
-    sessionsData.cmdAuthsCount = 1;
-
-    rval = Tss2_Sys_Load (sapi_context,
-                          parentHandle,
-                          &sessionsData,
-                          inPrivate,
-                          inPublic,
-                          &handle2048rsa,
-                          &nameExt,
-                          &sessionsDataOut);
-    if(rval != TPM_RC_SUCCESS)
-    {
-        printf("\nLoad Object Failed ! ErrorCode: 0x%0x\n\n",rval);
-        return -1;
+    switch (key) {
+    case 'P':
+        ctx.parent.auth_str = value;
+        break;
+    case 'u':
+        ctx.object.pubpath = value;
+        break;
+    case 'r':
+        ctx.object.privpath = value;
+        break;
+    case 'n':
+        ctx.namepath = value;
+        break;
+    case 'C':
+        ctx.parent.ctx_path = value;
+        break;
+    case 'c':
+        ctx.contextpath = value;
+        break;
+    case 0:
+        ctx.cp_hash_path = value;
+        break;
     }
-    printf("\nLoad succ.\nLoadedHandle: 0x%08x\n\n",handle2048rsa);
 
-    /* TODO fix serialization */
-    if(!files_save_bytes_to_file(outFileName, (UINT8 *)&nameExt, sizeof(nameExt)))
-        return -2;
-
-    return 0;
+    return true;
 }
 
-int
-execute_tool (int              argc,
-              char             *argv[],
-              char             *envp[],
-              common_opts_t    *opts,
-              TSS2_SYS_CONTEXT *sapi_context)
-{
-    (void) envp;
-    (void) opts;
+static bool tpm2_tool_onstart(tpm2_options **opts) {
 
-    TPMI_DH_OBJECT parentHandle;
-    TPM2B_PUBLIC  inPublic;
-    TPM2B_PRIVATE inPrivate;
-    UINT16 size;
-    char *outFilePath = NULL;
-    char *contextFile = NULL;
-    char *contextParentFilePath = NULL;
-
-    memset(&inPublic,0,sizeof(TPM2B_PUBLIC));
-    memset(&inPrivate,0,sizeof(TPM2B_SENSITIVE));
-
-    setbuf(stdout, NULL);
-    setvbuf (stdout, NULL, _IONBF, BUFSIZ);
-
-    int opt = -1;
-    const char *optstring = "H:P:u:r:n:C:c:S:X";
-    static struct option long_options[] = {
-      {"parent",1,NULL,'H'},
-      {"pwdp",1,NULL,'P'},
-      {"pubfile",1,NULL,'u'},
-      {"privfile",1,NULL,'r'},
-      {"name",1,NULL,'n'},
-      {"context",1,NULL,'C'},
-      {"contextParent",1,NULL,'c'},
-      {"passwdInHex",0,NULL,'X'},
-      {"input-session-handle",1,NULL,'S'},
-      {0,0,0,0}
+    const struct option topts[] = {
+      { "auth",           required_argument, NULL, 'P' },
+      { "public",         required_argument, NULL, 'u' },
+      { "private",        required_argument, NULL, 'r' },
+      { "name",           required_argument, NULL, 'n' },
+      { "key-context",    required_argument, NULL, 'c' },
+      { "parent-context", required_argument, NULL, 'C' },
+      { "cphash",         required_argument, NULL,  0  },
     };
 
-    int returnVal = 0;
-    int flagCnt = 0;
-    int H_flag = 0,
-        P_flag = 0,
-        u_flag = 0,
-        r_flag = 0,
-        c_flag = 0,
-        C_flag = 0,
-        n_flag = 0;
+    *opts = tpm2_options_new("P:u:r:n:C:c:", ARRAY_LEN(topts), topts, on_option,
+            NULL, 0);
 
-    while((opt = getopt_long(argc,argv,optstring,long_options,NULL)) != -1)
-    {
-        switch(opt)
-        {
-        case 'H':
-            if (!tpm2_util_string_to_uint32(optarg, &parentHandle))
-            {
-                returnVal = -1;
-                break;
-            }
-            printf("\nparentHandle: 0x%x\n\n",parentHandle);
-            H_flag = 1;
-            break;
-        case 'P':
-            if(!password_tpm2_util_copy_password(optarg, "parent key", &sessionData.hmac))
-            {
-                returnVal = -2;
-                break;
-            }
-            P_flag = 1;
-            break;
-
-        case 'u':
-            size = sizeof(inPublic);
-            if(!files_load_bytes_from_file(optarg, (UINT8 *)&inPublic, &size))
-            {
-                returnVal = -3;
-                break;
-            }
-            u_flag = 1;
-            break;
-        case 'r':
-            size = sizeof(inPrivate);
-            if(!files_load_bytes_from_file(optarg, (UINT8 *)&inPrivate, &size))
-            {
-                returnVal = -4;
-                break;
-            }
-            r_flag = 1;
-            break;
-        case 'n':
-            outFilePath = optarg;
-            if(files_does_file_exist(outFilePath))
-            {
-                returnVal = -5;
-                break;
-            }
-            n_flag = 1;
-            break;
-        case 'c':
-            contextParentFilePath = optarg;
-            if(contextParentFilePath == NULL || contextParentFilePath[0] == '\0')
-            {
-                returnVal = -8;
-                break;
-            }
-            printf("contextParentFile = %s\n", contextParentFilePath);
-            c_flag = 1;
-            break;
-        case 'C':
-            contextFile = optarg;
-            if(contextFile == NULL || contextFile[0] == '\0')
-            {
-                returnVal = -9;
-                break;
-            }
-            printf("contextFile = %s\n", contextFile);
-            C_flag = 1;
-            break;
-        case 'X':
-            hexPasswd = true;
-            break;
-        case 'S':
-             if (!tpm2_util_string_to_uint32(optarg, &sessionData.sessionHandle)) {
-                 LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                         optarg);
-                 returnVal = 1;
-             }
-             break;
-        case ':':
-//              printf("Argument %c needs a value!\n",optopt);
-            returnVal = -10;
-            break;
-        case '?':
-//              printf("Unknown Argument: %c\n",optopt);
-            returnVal = -11;
-            break;
-        //default:
-        //  break;
-        }
-        if(returnVal)
-            break;
-    };
-
-    if(returnVal != 0)
-        return returnVal;
-
-    if (P_flag && hexPasswd) {
-        int rc = tpm2_util_hex_to_byte_structure((char *)sessionData.hmac.t.buffer,
-                          &sessionData.hmac.t.size,
-                          sessionData.hmac.t.buffer);
-        if (rc) {
-            LOG_ERR("Could not convert password to hex!");
-        }
-    }
-
-    flagCnt = H_flag + u_flag +r_flag + n_flag + c_flag;
-    if(flagCnt == 4 && (H_flag == 1 || c_flag == 1) && u_flag == 1 && r_flag == 1 && n_flag == 1)
-    {
-        if(c_flag) {
-            returnVal = file_load_tpm_context_from_file (sapi_context,
-                                                &parentHandle,
-                                                contextParentFilePath) != true;
-        }
-        if (returnVal == 0) {
-            returnVal = load (sapi_context,
-                              parentHandle,
-                              &inPublic,
-                              &inPrivate,
-                              outFilePath);
-        }
-        if (returnVal == 0 && C_flag) {
-            returnVal = files_save_tpm_context_to_file (sapi_context,
-                                              handle2048rsa,
-                                              contextFile) != true;
-        }
-        if(returnVal)
-            return -13;
-    }
-    else
-    {
-        showArgMismatch(argv[0]);
-        return -14;
-    }
-
-    return 0;
+    return *opts != NULL;
 }
+
+static tool_rc check_opts(void) {
+
+    tool_rc rc = tool_rc_success;
+    if (!ctx.parent.ctx_path) {
+        LOG_ERR("Expected parent object via -C");
+        rc = tool_rc_option_error;
+    }
+
+    if (!ctx.object.pubpath) {
+        LOG_ERR("Expected public object portion via -u");
+        rc = tool_rc_option_error;
+    }
+
+    if (!ctx.object.privpath) {
+        LOG_ERR("Expected public object portion via -r");
+        rc = tool_rc_option_error;
+    }
+
+    if (!ctx.contextpath && !ctx.cp_hash_path) {
+        LOG_ERR("Expected option -c");
+        rc = tool_rc_option_error;
+    }
+
+    if (ctx.contextpath && ctx.cp_hash_path) {
+        LOG_ERR("Cannot output contextpath when calculating cp_hash");
+        rc = tool_rc_option_error;
+    }
+
+    return rc;
+}
+
+static tool_rc init(ESYS_CONTEXT *ectx) {
+
+    bool res = files_load_public(ctx.object.pubpath, &ctx.object.public);
+    if (!res) {
+        return tool_rc_general_error;
+    }
+
+    res = files_load_private(ctx.object.privpath, &ctx.object.private);
+    if (!res) {
+        return tool_rc_general_error;
+    }
+
+    return tpm2_util_object_load_auth(ectx, ctx.parent.ctx_path,
+            ctx.parent.auth_str, &ctx.parent.object, false,
+            TPM2_HANDLE_ALL_W_NV);
+}
+
+static tool_rc finish(ESYS_CONTEXT *ectx) {
+
+    TPM2B_NAME *name;
+    tool_rc rc = tpm2_tr_get_name(ectx, ctx.object.handle, &name);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    if (ctx.namepath) {
+        bool result = files_save_bytes_to_file(ctx.namepath, name->name,
+                name->size);
+        free(name);
+        if (!result) {
+            return tool_rc_general_error;
+        }
+    } else {
+        tpm2_tool_output("name: ");
+        tpm2_util_print_tpm2b(name);
+        tpm2_tool_output("\n");
+        free(name);
+    }
+
+    return files_save_tpm_context_to_path(ectx, ctx.object.handle,
+            ctx.contextpath);
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    tool_rc rc = check_opts();
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    rc = init(ectx);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    if (!ctx.cp_hash_path) {
+        rc = tpm2_load(ectx, &ctx.parent.object, &ctx.object.private,
+            &ctx.object.public, &ctx.object.handle, NULL);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+
+        return finish(ectx);
+    }
+
+    TPM2B_DIGEST cp_hash = { .size = 0 };
+    rc = tpm2_load(ectx, &ctx.parent.object, &ctx.object.private,
+            &ctx.object.public, &ctx.object.handle, &cp_hash);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+    if (!result) {
+        rc = tool_rc_general_error;
+    }
+
+    return rc;
+}
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+    return tpm2_session_close(&ctx.parent.object.session);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("load", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

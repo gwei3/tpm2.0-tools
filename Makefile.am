@@ -1,230 +1,626 @@
-#;**********************************************************************;
-#
-# Copyright (c) 2015, Intel Corporation
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice,
-# this list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-#
-# 3. Neither the name of Intel Corporation nor the names of its contributors
-# may be used to endorse or promote products derived from this software without
-# specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-# THE POSSIBILITY OF SUCH DAMAGE.
-#;**********************************************************************;
+# SPDX-License-Identifier: BSD-3-Clause
 
-ACLOCAL_AMFLAGS = -I m4
+# ax_code_coverage
+if AUTOCONF_CODE_COVERAGE_2019_01_06
+include $(top_srcdir)/aminclude_static.am
+clean-local: code-coverage-clean
+distclean-local: code-coverage-dist-clean
+else
+@CODE_COVERAGE_RULES@
+endif
 
-INCLUDE_DIRS = -I$(srcdir)/src -I$(srcdir)/lib
+include src_vars.mk
+
+ACLOCAL_AMFLAGS = -I m4 --install
+
+INCLUDE_DIRS = -I$(top_srcdir)/tools -I$(top_srcdir)/lib
 LIB_COMMON := lib/libcommon.a
 
-AM_CFLAGS    := $(INCLUDE_DIRS) $(TPM20_TSS_CFLAGS) $(EXTRA_CFLAGS) $(TCTI_TABRMD_CFLAGS) $(CRYPTO_CFLAGS)
-AM_LDFLAGS   := $(EXTRA_LDFLAGS)
+AM_CFLAGS := \
+    $(INCLUDE_DIRS) $(EXTRA_CFLAGS) $(TSS2_ESYS_CFLAGS) $(TSS2_MU_CFLAGS) \
+    $(CRYPTO_CFLAGS) $(CODE_COVERAGE_CFLAGS) $(TSS2_TCTILDR_CFLAGS) \
+    $(TSS2_RC_CFLAGS) $(TSS2_SYS_CFLAGS) $(UUID_CFLAGS)
 
-LDADD = $(LIB_COMMON) $(TPM20_TSS_LIBS) $(TCTI_SOCK_LIBS) $(TCTI_DEV_LIBS) $(TCTI_TABRMD_LIBS) $(CRYPTO_LIBS)
+AM_LDFLAGS   := $(EXTRA_LDFLAGS) $(CODE_COVERAGE_LIBS)
 
-sbin_PROGRAMS = \
-    tools/tpm2_create \
-    tools/tpm2_createprimary \
-    tools/tpm2_load \
-    tools/tpm2_send_command \
-    tools/tpm2_dump_capability \
-    tools/tpm2_listpcrs \
-    tools/tpm2_listpersistent \
-    tools/tpm2_startup \
-    tools/tpm2_rc_decode \
-    tools/tpm2_verifysignature \
-    tools/tpm2_getmanufec \
-    tools/tpm2_quote \
-    tools/tpm2_takeownership \
-    tools/tpm2_getpubek \
-    tools/tpm2_getpubak \
-    tools/tpm2_akparse \
-    tools/tpm2_hash \
-    tools/tpm2_activatecredential \
-    tools/tpm2_makecredential \
-    tools/tpm2_nvlist \
-    tools/tpm2_nvread \
-    tools/tpm2_nvreadlock \
-    tools/tpm2_nvwrite \
-    tools/tpm2_nvdefine \
-    tools/tpm2_nvrelease \
-    tools/tpm2_hmac \
-    tools/tpm2_certify \
-    tools/tpm2_readpublic \
-    tools/tpm2_getrandom \
-    tools/tpm2_encryptdecrypt \
-    tools/tpm2_evictcontrol \
-    tools/tpm2_loadexternal \
-    tools/tpm2_rsadecrypt \
-    tools/tpm2_rsaencrypt \
-    tools/tpm2_sign \
-    tools/tpm2_unseal \
-    tools/tpm2_dictionarylockout \
-    tools/tpm2_createpolicy
+LDADD = \
+    $(LIB_COMMON) $(TSS2_ESYS_LIBS) $(TSS2_MU_LIBS) $(CRYPTO_LIBS) $(TSS2_TCTILDR_LIBS) \
+    $(TSS2_RC_LIBS) $(TSS2_SYS_LIBS) $(UUID_LIBS)
+
+AM_DISTCHECK_CONFIGURE_FLAGS = --with-bashcompdir='$$(datarootdir)/bash-completion/completions'
+
+# keep me sorted
+bin_PROGRAMS =
+FAPI_CFLAGS = $(EXTRA_CFLAGS) $(TSS2_FAPI_CFLAGS) $(CODE_COVERAGE_CFLAGS)
+TESTS =
+
+if HAVE_FAPI
+
+bin_PROGRAMS += tools/fapi/tss2
+
+endif
 
 noinst_LIBRARIES = $(LIB_COMMON)
-lib_libcommon_a_SOURCES = \
-    lib/context-util.c \
-    lib/files.c \
-    lib/log.c \
-    lib/options.c \
-    lib/password_util.c \
-    lib/pcr.c \
-    lib/rc-decode.c \
-    lib/tpm_hash.c \
-    lib/tpm_hmac.c \
-    lib/tpm_kdfa.c \
-    lib/tpm_session.c \
-    lib/tpm2_util.c
+lib_libcommon_a_SOURCES = $(LIB_SRC)
+lib_libcommon_a_CFLAGS = -fPIC $(AM_CFLAGS)
 
-tools_tpm2_create_SOURCES = tools/tpm2_create.c tools/main.c
-tools_tpm2_createprimary_SOURCES = tools/tpm2_createprimary.c tools/main.c
-tools_tpm2_dump_capability_SOURCES = tools/tpm2_dump_capability.c tools/main.c
-tools_tpm2_listpcrs_SOURCES = tools/tpm2_listpcrs.c tools/main.c
-tools_tpm2_listpersistent_SOURCES = tools/tpm2_listpersistent.c tools/main.c
-tools_tpm2_load_SOURCES = tools/tpm2_load.c tools/main.c
-tools_tpm2_send_command_SOURCES = tools/tpm2_send_command.c tools/main.c
-tools_tpm2_startup_SOURCES = tools/tpm2_startup.c tools/main.c
-tools_tpm2_verifysignature_SOURCES = tools/tpm2_verifysignature.c tools/main.c
-tools_tpm2_getmanufec_CFLAG = $(AM_CFLAGS) $(CURL_CFLAGS)
-tools_tpm2_getmanufec_LDADD = $(LDADD) $(CURL_LIBS)
-tools_tpm2_getmanufec_SOURCES = tools/tpm2_getmanufec.c tools/main.c
-tools_tpm2_quote_SOURCES = tools/tpm2_quote.c tools/main.c
-tools_tpm2_takeownership_SOURCES = tools/tpm2_takeownership.c tools/main.c
-tools_tpm2_getpubek_SOURCES = tools/tpm2_getpubek.c tools/main.c
-tools_tpm2_getpubak_SOURCES = tools/tpm2_getpubak.c tools/main.c
-tools_tpm2_akparse_SOURCES = tools/tpm2_akparse.c tools/main.c
-tools_tpm2_hash_SOURCES = tools/tpm2_hash.c tools/main.c
-tools_tpm2_activatecredential_SOURCES = tools/tpm2_activatecredential.c tools/main.c
-tools_tpm2_makecredential_SOURCES = tools/tpm2_makecredential.c tools/main.c
-tools_tpm2_nvlist_SOURCES = tools/tpm2_nvlist.c tools/main.c
-tools_tpm2_nvread_SOURCES = tools/tpm2_nvread.c tools/main.c
-tools_tpm2_nvreadlock_SOURCES = tools/tpm2_nvreadlock.c tools/main.c
-tools_tpm2_nvwrite_SOURCES = tools/tpm2_nvwrite.c tools/main.c
-tools_tpm2_nvdefine_SOURCES = tools/tpm2_nvdefine.c tools/main.c
-tools_tpm2_nvrelease_SOURCES = tools/tpm2_nvrelease.c tools/main.c
-tools_tpm2_hmac_SOURCES = tools/tpm2_hmac.c tools/main.c
-tools_tpm2_certify_SOURCES = tools/tpm2_certify.c tools/main.c
-tools_tpm2_readpublic_SOURCES = tools/tpm2_readpublic.c tools/main.c
-tools_tpm2_getrandom_SOURCES = tools/tpm2_getrandom.c tools/main.c
-tools_tpm2_encryptdecrypt_SOURCES = tools/tpm2_encryptdecrypt.c tools/main.c
-tools_tpm2_evictcontrol_SOURCES = tools/tpm2_evictcontrol.c tools/main.c
-tools_tpm2_loadexternal_SOURCES = tools/tpm2_loadexternal.c tools/main.c
-tools_tpm2_rsadecrypt_SOURCES = tools/tpm2_rsadecrypt.c tools/main.c
-tools_tpm2_rsaencrypt_SOURCES = tools/tpm2_rsaencrypt.c tools/main.c
-tools_tpm2_sign_SOURCES = tools/tpm2_sign.c tools/main.c
-tools_tpm2_unseal_SOURCES = tools/tpm2_unseal.c tools/main.c
-tools_tpm2_dictionarylockout_SOURCES = tools/tpm2_dictionarylockout.c tools/main.c
-tools_tpm2_createpolicy_SOURCES = tools/tpm2_createpolicy.c tools/main.c
+tools_fapi_tss2_CFLAGS = $(FAPI_CFLAGS) -DTSS2_TOOLS_MAX="$(words $(tss2_tools))"
+tools_fapi_tss2_LDFLAGS = $(TSS2_FAPI_LIBS)
+tools_fapi_tss2_SOURCES = \
+	tools/fapi/tss2_template.c \
+	tools/fapi/tss2_template.h \
+	$(tss2_tools)
 
-# rc_decode does not use common main, since it does not need a dynamic TCTI.
-tools_tpm2_rc_decode_SOURCES = lib/rc-decode.c tools/tpm2_rc_decode.c
+tss2_tools = \
+    tools/fapi/tss2_decrypt.c \
+    tools/fapi/tss2_encrypt.c \
+    tools/fapi/tss2_list.c \
+    tools/fapi/tss2_changeauth.c \
+    tools/fapi/tss2_delete.c \
+    tools/fapi/tss2_import.c \
+    tools/fapi/tss2_getinfo.c \
+    tools/fapi/tss2_createkey.c \
+    tools/fapi/tss2_createseal.c \
+    tools/fapi/tss2_exportkey.c \
+    tools/fapi/tss2_getcertificate.c \
+    tools/fapi/tss2_getplatformcertificates.c \
+    tools/fapi/tss2_gettpmblobs.c \
+    tools/fapi/tss2_getappdata.c \
+    tools/fapi/tss2_setappdata.c \
+    tools/fapi/tss2_setcertificate.c \
+    tools/fapi/tss2_sign.c \
+    tools/fapi/tss2_verifysignature.c \
+    tools/fapi/tss2_verifyquote.c \
+    tools/fapi/tss2_createnv.c \
+    tools/fapi/tss2_nvextend.c \
+    tools/fapi/tss2_nvincrement.c \
+    tools/fapi/tss2_nvread.c \
+    tools/fapi/tss2_nvsetbits.c \
+    tools/fapi/tss2_nvwrite.c \
+    tools/fapi/tss2_getdescription.c \
+    tools/fapi/tss2_setdescription.c \
+    tools/fapi/tss2_pcrextend.c \
+    tools/fapi/tss2_quote.c \
+    tools/fapi/tss2_pcrread.c \
+    tools/fapi/tss2_authorizepolicy.c \
+    tools/fapi/tss2_exportpolicy.c \
+    tools/fapi/tss2_import.c \
+    tools/fapi/tss2_provision.c \
+    tools/fapi/tss2_getrandom.c \
+    tools/fapi/tss2_unseal.c \
+    tools/fapi/tss2_writeauthorizenv.c
+
+
+# Bundle all the tools into a single program similar to busybox
+bin_PROGRAMS += tools/tpm2
+tools_tpm2_LDADD = $(LDADD) $(CURL_LIBS)
+tools_tpm2_CFLAGS = $(AM_CFLAGS) -DTPM2_TOOLS_MAX="$(words $(tpm2_tools))"
+tools_tpm2_SOURCES = \
+	tools/tpm2_tool.c \
+	tools/tpm2_tool.h \
+	$(tpm2_tools)
+
+tpm2_tools = \
+    tools/misc/tpm2_certifyX509certutil.c \
+    tools/misc/tpm2_checkquote.c \
+    tools/misc/tpm2_eventlog.c \
+    tools/misc/tpm2_print.c \
+    tools/misc/tpm2_rc_decode.c \
+    tools/tpm2_activatecredential.c \
+    tools/tpm2_certify.c \
+    tools/tpm2_changeauth.c \
+    tools/tpm2_changeeps.c \
+    tools/tpm2_changepps.c \
+    tools/tpm2_clear.c \
+    tools/tpm2_clearcontrol.c \
+    tools/tpm2_clockrateadjust.c \
+    tools/tpm2_create.c \
+    tools/tpm2_createak.c \
+    tools/tpm2_createek.c \
+    tools/tpm2_createpolicy.c \
+    tools/tpm2_setprimarypolicy.c \
+    tools/tpm2_createprimary.c \
+    tools/tpm2_dictionarylockout.c \
+    tools/tpm2_duplicate.c \
+    tools/tpm2_getcap.c \
+    tools/tpm2_gettestresult.c \
+    tools/tpm2_encryptdecrypt.c \
+    tools/tpm2_evictcontrol.c \
+    tools/tpm2_flushcontext.c \
+    tools/tpm2_getekcertificate.c \
+    tools/tpm2_getrandom.c \
+    tools/tpm2_gettime.c \
+    tools/tpm2_hash.c \
+    tools/tpm2_hierarchycontrol.c \
+    tools/tpm2_hmac.c \
+    tools/tpm2_import.c \
+    tools/tpm2_incrementalselftest.c \
+    tools/tpm2_load.c \
+    tools/tpm2_loadexternal.c \
+    tools/tpm2_makecredential.c \
+    tools/tpm2_nvdefine.c \
+    tools/tpm2_nvextend.c \
+    tools/tpm2_nvincrement.c \
+    tools/tpm2_nvreadpublic.c \
+    tools/tpm2_nvread.c \
+    tools/tpm2_nvreadlock.c \
+    tools/tpm2_nvundefine.c \
+    tools/tpm2_nvwrite.c \
+    tools/tpm2_nvwritelock.c \
+    tools/tpm2_nvsetbits.c \
+    tools/tpm2_pcrallocate.c \
+    tools/tpm2_pcrevent.c \
+    tools/tpm2_pcrextend.c \
+    tools/tpm2_pcrread.c \
+    tools/tpm2_pcrreset.c \
+    tools/tpm2_policypcr.c \
+    tools/tpm2_policyauthorize.c \
+    tools/tpm2_policyauthorizenv.c \
+    tools/tpm2_policynv.c \
+    tools/tpm2_policycountertimer.c \
+    tools/tpm2_policyor.c \
+    tools/tpm2_policynamehash.c \
+    tools/tpm2_policytemplate.c \
+    tools/tpm2_policycphash.c \
+    tools/tpm2_policypassword.c \
+    tools/tpm2_policysigned.c \
+    tools/tpm2_policyticket.c \
+    tools/tpm2_policyauthvalue.c \
+    tools/tpm2_policysecret.c \
+    tools/tpm2_policyrestart.c \
+    tools/tpm2_policycommandcode.c \
+    tools/tpm2_policynvwritten.c \
+    tools/tpm2_policyduplicationselect.c \
+    tools/tpm2_policylocality.c \
+    tools/tpm2_quote.c \
+    tools/tpm2_readclock.c \
+    tools/tpm2_readpublic.c \
+    tools/tpm2_rsadecrypt.c \
+    tools/tpm2_rsaencrypt.c \
+    tools/tpm2_send.c \
+    tools/tpm2_selftest.c \
+    tools/tpm2_setclock.c \
+    tools/tpm2_shutdown.c \
+    tools/tpm2_sign.c \
+    tools/tpm2_certifycreation.c \
+    tools/tpm2_nvcertify.c \
+    tools/tpm2_startauthsession.c \
+    tools/tpm2_startup.c \
+    tools/tpm2_stirrandom.c \
+    tools/tpm2_testparms.c \
+    tools/tpm2_unseal.c \
+    tools/tpm2_verifysignature.c \
+    tools/tpm2_setcommandauditstatus.c \
+    tools/tpm2_getcommandauditdigest.c \
+    tools/tpm2_getsessionauditdigest.c \
+    tools/tpm2_geteccparameters.c \
+    tools/tpm2_ecephermal.c \
+    tools/tpm2_commit.c \
+    tools/tpm2_ecdhkeygen.c \
+    tools/tpm2_ecdhzgen.c \
+    tools/tpm2_zgen2phase.c
+
+# Create the symlinks for each tool to the tpm2 and optional tss2 bundled executables
+install-exec-hook:
+	for tool in $(notdir $(basename $(tpm2_tools))) ; do \
+		$(LN_S) -f \
+		"tpm2$(EXEEXT)" \
+		"$(DESTDIR)$(bindir)/$$tool$(EXEEXT)" ; \
+	done
+if HAVE_FAPI
+	for tool in $(notdir $(basename $(tss2_tools))) ; do \
+		$(LN_S) -f \
+		"tss2$(EXEEXT)" \
+		"$(DESTDIR)$(bindir)/$$tool$(EXEEXT)" ; \
+	done
+endif
 
 if UNIT
-TESTS = $(check_PROGRAMS)
+TESTS += $(check_PROGRAMS)
 check_PROGRAMS = \
-    test/unit/tpm2-rc-decode_unit \
-    test/unit/tpm2-rc-entry_unit \
     test/unit/test_string_bytes \
     test/unit/test_files \
-    test/unit/test_tpm2_header
+    test/unit/test_tpm2_header \
+    test/unit/test_tpm2_attr_util \
+    test/unit/test_tpm2_alg_util \
+    test/unit/test_pcr \
+    test/unit/test_tpm2_auth_util \
+    test/unit/test_tpm2_errata \
+    test/unit/test_tpm2_session \
+    test/unit/test_tpm2_policy \
+    test/unit/test_tpm2_util \
+    test/unit/test_options \
+    test/unit/test_cc_util \
+    test/unit/test_tpm2_eventlog \
+    test/unit/test_tpm2_eventlog_yaml
 
-test_unit_tpm2_rc_decode_unit_CFLAGS  = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
-test_unit_tpm2_rc_decode_unit_LDADD   = $(CMOCKA_LIBS) $(LIB_COMMON)
-test_unit_tpm2_rc_decode_unit_SOURCES = test/unit/tpm2-rc-decode_unit.c
+TESTS += $(ALL_SYSTEM_TESTS)
 
-test_unit_tpm2_rc_entry_unit_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
-test_unit_tpm2_rc_entry_unit_LDADD    = $(CMOCKA_LIBS) $(LIB_COMMON)
-test_unit_tpm2_rc_entry_unit_SOURCES  = test/unit/tpm2-rc-entry_unit.c
+if HAVE_FAPI
+TESTS += $(ALL_FAPI_TESTS)
+endif
 
 test_unit_test_string_bytes_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
-test_unit_test_string_bytes_LDADD    = $(CMOCKA_LIBS) $(LIB_COMMON)
-test_unit_test_string_bytes_SOURCES  = test/unit/test_string_bytes.c
+test_unit_test_string_bytes_LDADD    = $(CMOCKA_LIBS) $(LDADD)
 
 test_unit_test_files_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
-test_unit_test_files_LDADD    = $(LIB_COMMON) $(CMOCKA_LIBS) $(TPM20_TSS_LIBS) \
-	$(TCTI_SOCK_LIBS) $(TCTI_DEV_LIBS)
-test_unit_test_files_SOURCES  = test/unit/test_files.c
+test_unit_test_files_LDADD    = $(CMOCKA_LIBS) $(LDADD)
 
 test_unit_test_tpm2_header_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
-test_unit_test_tpm2_header_LDADD    = $(CMOCKA_LIBS) $(LIB_COMMON)
-test_unit_test_tpm2_header_SOURCES  = test/unit/test_tpm2_header.c
+test_unit_test_tpm2_header_LDADD    = $(CMOCKA_LIBS) $(LDADD)
 
+test_unit_test_tpm2_attr_util_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_attr_util_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_tpm2_alg_util_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_alg_util_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_pcr_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_pcr_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_tpm2_auth_util_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_auth_util_LDFLAGS  = -Wl,--wrap=Esys_TR_SetAuth \
+                                         -Wl,--wrap=Esys_StartAuthSession \
+                                         -Wl,--wrap=fopen \
+                                         -Wl,--wrap=fread \
+                                         -Wl,--wrap=fseek \
+                                         -Wl,--wrap=ftell \
+                                         -Wl,--wrap=feof, \
+                                         -Wl,--wrap=fclose
+test_unit_test_tpm2_auth_util_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_tpm2_errata_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_errata_LDFLAGS  = -Wl,--wrap=Esys_GetCapability
+test_unit_test_tpm2_errata_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_tpm2_session_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_session_LDFLAGS  = -Wl,--wrap=Esys_StartAuthSession \
+                                       -Wl,--wrap=tpm2_context_save \
+                                       -Wl,--wrap=Esys_ContextLoad \
+                                       -Wl,--wrap=Esys_PolicyRestart \
+                                       -Wl,--wrap=Esys_TR_GetName \
+                                       -Wl,--wrap=tpm2_flush_context
+
+test_unit_test_tpm2_session_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_tpm2_policy_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_policy_LDFLAGS  = -Wl,--wrap=Esys_StartAuthSession \
+                                      -Wl,--wrap=Esys_PolicyPCR \
+                                      -Wl,--wrap=Esys_PCR_Read \
+                                      -Wl,--wrap=Esys_PolicyGetDigest \
+                                      -Wl,--wrap=Esys_FlushContext
+
+test_unit_test_tpm2_policy_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_tpm2_util_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_util_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_options_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_options_LDFLAGS  = -Wl,--wrap=Tss2_TctiLdr_Initialize \
+                               -Wl,--wrap=tpm2_util_getenv
+test_unit_test_options_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_cc_util_CFLAGS   = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_cc_util_LDADD    = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_tpm2_eventlog_CFLAGS = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_eventlog_LDADD = $(CMOCKA_LIBS) $(LDADD)
+
+test_unit_test_tpm2_eventlog_yaml_CFLAGS = $(AM_CFLAGS) $(CMOCKA_CFLAGS)
+test_unit_test_tpm2_eventlog_yaml_LDADD = $(CMOCKA_LIBS) $(LDADD)
+
+AM_TESTS_ENVIRONMENT =	\
+	TPM2_ABRMD=tpm2-abrmd; export TPM2_ABRMD; \
+	TPM2_SIM=tpm_server; export TPM2_SIM; \
+	PATH=$(abs_builddir)/tools:$(abs_builddir)/tools/misc:$(abs_top_srcdir)/test/integration:$(PATH); \
+	TPM2_TOOLS_TEST_FIXTURES=$(abs_top_srcdir)/test/integration/fixtures; \
+	SRCDIR=$(abs_srcdir); export SRCDIR; BUILDDIR=$(abs_builddir); export BUILDDIR; \
+	export TPM2_TOOLS_TEST_FIXTURES;
+
+if PERSISTENT
+    AM_TESTS_ENVIRONMENT +=	\
+        TPM2TOOLS_TEST_PERSISTENT=true; export TPM2TOOLS_TEST_PERSISTENT;
+else
+    AM_TESTS_ENVIRONMENT +=	\
+        TPM2TOOLS_TEST_PERSISTENT=false; export TPM2TOOLS_TEST_PERSISTENT;
 endif
 
-man8_MANS = \
-    man/man8/tpm2_createprimary.8 \
-    man/man8/tpm2_dump_capability.8 \
-    man/man8/tpm2_send_command.8 \
-    man/man8/tpm2_startup.8 \
-    man/man8/tpm2_listpcrs.8 \
-    man/man8/tpm2_quote.8 \
-    man/man8/tpm2_takeownership.8 \
-    man/man8/tpm2_getpubek.8 \
-    man/man8/tpm2_getpubak.8 \
-    man/man8/tpm2_getmanufec.8 \
-    man/man8/tpm2_akparse.8 \
-    man/man8/tpm2_makecredential.8 \
-    man/man8/tpm2_activatecredential.8 \
-    man/man8/tpm2_hash.8 \
-    man/man8/tpm2_nvlist.8 \
-    man/man8/tpm2_nvread.8 \
-    man/man8/tpm2_nvreadlock.8 \
-    man/man8/tpm2_nvwrite.8 \
-    man/man8/tpm2_nvdefine.8 \
-    man/man8/tpm2_nvrelease.8 \
-    man/man8/tpm2_create.8 \
-    man/man8/tpm2_hmac.8 \
-    man/man8/tpm2_certify.8 \
-    man/man8/tpm2_readpublic.8 \
-    man/man8/tpm2_getrandom.8 \
-    man/man8/tpm2_encryptdecrypt.8 \
-    man/man8/tpm2_evictcontrol.8 \
-    man/man8/tpm2_load.8 \
-    man/man8/tpm2_loadexternal.8 \
-    man/man8/tpm2_rsadecrypt.8 \
-    man/man8/tpm2_rsaencrypt.8 \
-    man/man8/tpm2_sign.8 \
-    man/man8/tpm2_unseal.8 \
-    man/man8/tpm2_verifysignature.8 \
-    man/man8/tpm2_listpersistent.8 \
-    man/man8/tpm2_rc_decode.8 \
-    man/man8/tpm2_dictionarylockout.8 \
-    man/man8/tpm2_createpolicy.8
-
-man/man8/%.8 : man/%.8.in man/tcti-options.troff man/tcti-environment.troff
-	rm -f $@
-	mkdir -p man/man8
-if HAVE_TCTI_DEV
-	echo ".nr HAVE_TCTI_DEV 1" >> $@
+SH_LOG_COMPILER = dbus-run-session bash
+AM_SH_LOG_FLAGS = --
 endif
-if HAVE_TCTI_SOCK
-	echo ".nr HAVE_TCTI_SOCK 1" >> $@
-endif
-	sed -e '/@COMMON_OPTIONS_INCLUDE@/r man/common-options.troff' \
-	    -e '/@COMMON_OPTIONS_INCLUDE@/d' \
-	    -e '/@TCTI_OPTIONS_INCLUDE@/r man/tcti-options.troff' \
-	    -e '/@TCTI_OPTIONS_INCLUDE@/d' \
-	    -e '/@TCTI_ENVIRONMENT_INCLUDE@/r man/tcti-environment.troff' \
-	    -e '/@TCTI_ENVIRONMENT_INCLUDE@/d' \
-	    < $< >> $@
 
-CLEANFILES = $(man8_MANS)
+TEST_EXTENSIONS = .sh
+
+check-hook:
+	rm -rf .lock_file
+
+EXTRA_DIST_IGNORE = \
+    .gitignore \
+    .deps
+
+EXTRA_DIST = \
+    bootstrap \
+    doc/AUTHORS.md \
+    doc/CHANGELOG.md \
+    doc/CONTRIBUTING.md \
+    doc/INSTALL.md \
+    doc/LICENSE \
+    doc/MAINTAINERS.md \
+    README.md \
+    doc/RELEASE.md \
+    man \
+    scripts \
+    test
+
+if HAVE_MAN_PAGES
+    dist_man1_MANS := \
+    man/man1/tpm2_activatecredential.1 \
+    man/man1/tpm2_certify.1 \
+    man/man1/tpm2_certifyX509certutil.1 \
+    man/man1/tpm2_changeauth.1 \
+    man/man1/tpm2_changeeps.1 \
+    man/man1/tpm2_changepps.1 \
+    man/man1/tpm2_checkquote.1 \
+    man/man1/tpm2_clear.1 \
+    man/man1/tpm2_clearcontrol.1 \
+	man/man1/tpm2_clockrateadjust.1 \
+    man/man1/tpm2_create.1 \
+    man/man1/tpm2_createak.1 \
+    man/man1/tpm2_createek.1 \
+    man/man1/tpm2_createpolicy.1 \
+    man/man1/tpm2_setprimarypolicy.1 \
+    man/man1/tpm2_createprimary.1 \
+    man/man1/tpm2_dictionarylockout.1 \
+    man/man1/tpm2_duplicate.1 \
+    man/man1/tpm2_getcap.1 \
+    man/man1/tpm2_encryptdecrypt.1 \
+    man/man1/tpm2_eventlog.1 \
+    man/man1/tpm2_evictcontrol.1 \
+    man/man1/tpm2_flushcontext.1 \
+    man/man1/tpm2_getekcertificate.1 \
+    man/man1/tpm2_getrandom.1 \
+    man/man1/tpm2_gettestresult.1 \
+    man/man1/tpm2_gettime.1 \
+    man/man1/tpm2_hierarchycontrol.1 \
+    man/man1/tpm2_hash.1 \
+    man/man1/tpm2_hmac.1 \
+    man/man1/tpm2_import.1 \
+    man/man1/tpm2_incrementalselftest.1 \
+    man/man1/tpm2_load.1 \
+    man/man1/tpm2_loadexternal.1 \
+    man/man1/tpm2_makecredential.1 \
+    man/man1/tpm2_nvdefine.1 \
+    man/man1/tpm2_nvextend.1 \
+    man/man1/tpm2_nvincrement.1 \
+    man/man1/tpm2_nvreadpublic.1 \
+    man/man1/tpm2_nvread.1 \
+    man/man1/tpm2_nvreadlock.1 \
+    man/man1/tpm2_nvundefine.1 \
+    man/man1/tpm2_nvwrite.1 \
+    man/man1/tpm2_nvwritelock.1 \
+    man/man1/tpm2_nvsetbits.1 \
+    man/man1/tpm2_pcrallocate.1 \
+    man/man1/tpm2_pcrevent.1 \
+    man/man1/tpm2_pcrextend.1 \
+    man/man1/tpm2_pcrread.1 \
+    man/man1/tpm2_pcrreset.1 \
+    man/man1/tpm2_policypcr.1 \
+    man/man1/tpm2_policyrestart.1 \
+    man/man1/tpm2_policycommandcode.1 \
+    man/man1/tpm2_policynvwritten.1 \
+    man/man1/tpm2_policyduplicationselect.1 \
+    man/man1/tpm2_policylocality.1 \
+    man/man1/tpm2_policyauthorize.1 \
+    man/man1/tpm2_policyauthorizenv.1 \
+    man/man1/tpm2_policynv.1 \
+    man/man1/tpm2_policycountertimer.1 \
+    man/man1/tpm2_policyor.1 \
+    man/man1/tpm2_policynamehash.1 \
+    man/man1/tpm2_policytemplate.1 \
+    man/man1/tpm2_policycphash.1 \
+    man/man1/tpm2_policypassword.1 \
+    man/man1/tpm2_policysigned.1 \
+    man/man1/tpm2_policyticket.1 \
+    man/man1/tpm2_policyauthvalue.1 \
+    man/man1/tpm2_policysecret.1 \
+    man/man1/tpm2_print.1 \
+    man/man1/tpm2_quote.1 \
+    man/man1/tpm2_rc_decode.1 \
+    man/man1/tpm2_readclock.1 \
+    man/man1/tpm2_readpublic.1 \
+    man/man1/tpm2_rsadecrypt.1 \
+    man/man1/tpm2_rsaencrypt.1 \
+    man/man1/tpm2_send.1 \
+    man/man1/tpm2_selftest.1 \
+    man/man1/tpm2_setclock.1 \
+    man/man1/tpm2_shutdown.1 \
+    man/man1/tpm2_sign.1 \
+    man/man1/tpm2_certifycreation.1 \
+    man/man1/tpm2_nvcertify.1 \
+    man/man1/tpm2_startauthsession.1 \
+    man/man1/tpm2_startup.1 \
+    man/man1/tpm2_stirrandom.1 \
+    man/man1/tpm2_testparms.1 \
+    man/man1/tpm2_unseal.1 \
+    man/man1/tpm2_verifysignature.1 \
+    man/man1/tpm2_setcommandauditstatus.1 \
+    man/man1/tpm2_getcommandauditdigest.1 \
+    man/man1/tpm2_getsessionauditdigest.1 \
+    man/man1/tpm2_geteccparameters.1 \
+    man/man1/tpm2_ecephermal.1 \
+    man/man1/tpm2_commit.1 \
+    man/man1/tpm2_ecdhkeygen.1 \
+    man/man1/tpm2_ecdhzgen.1 \
+    man/man1/tpm2_zgen2phase.1 \
+    man/man1/tpm2.1
+
+if HAVE_FAPI
+dist_man1_MANS += \
+    man/man1/tss2_list.1 \
+    man/man1/tss2_changeauth.1 \
+    man/man1/tss2_delete.1 \
+    man/man1/tss2_import.1 \
+    man/man1/tss2_decrypt.1 \
+    man/man1/tss2_encrypt.1 \
+    man/man1/tss2_getinfo.1 \
+    man/man1/tss2_createnv.1 \
+    man/man1/tss2_nvread.1 \
+    man/man1/tss2_nvextend.1 \
+    man/man1/tss2_nvincrement.1 \
+    man/man1/tss2_nvsetbits.1 \
+    man/man1/tss2_nvwrite.1 \
+    man/man1/tss2_createkey.1 \
+    man/man1/tss2_createseal.1 \
+    man/man1/tss2_getcertificate.1 \
+    man/man1/tss2_getplatformcertificates.1 \
+    man/man1/tss2_gettpmblobs.1 \
+    man/man1/tss2_getappdata.1 \
+    man/man1/tss2_setappdata.1 \
+    man/man1/tss2_setcertificate.1 \
+    man/man1/tss2_exportkey.1 \
+    man/man1/tss2_sign.1 \
+    man/man1/tss2_verifysignature.1 \
+    man/man1/tss2_verifyquote.1 \
+    man/man1/tss2_getdescription.1 \
+    man/man1/tss2_setdescription.1 \
+    man/man1/tss2_pcrextend.1 \
+    man/man1/tss2_quote.1 \
+    man/man1/tss2_pcrread.1 \
+    man/man1/tss2_provision.1 \
+    man/man1/tss2_authorizepolicy.1 \
+    man/man1/tss2_exportpolicy.1 \
+    man/man1/tss2_unseal.1 \
+    man/man1/tss2_import.1 \
+    man/man1/tss2_getrandom.1 \
+    man/man1/tss2_writeauthorizenv.1
+endif
+endif
+
+MARKDOWN_COMMON_DEPS = \
+	man/common/alg.md \
+	man/common/authorizations.md \
+	man/common/ctxobj.md \
+	man/common/footer.md \
+	man/common/hash.md \
+	man/common/obj-attrs.md \
+	man/common/object-alg.md \
+	man/common/options.md \
+	man/common/policy-limitations.md \
+	man/common/pubkey.md \
+	man/common/returns.md \
+	man/common/signature.md \
+	man/common/signschemes.md \
+	man/common/tcti.md
+
+man/man1/%.1 : man/%.1.md $(MARKDOWN_COMMON_DEPS)
+	$(AM_V_GEN)rm -f $@ && \
+	mkdir -p man/man1 && \
+	sed -e '/\[common options\]/r $(top_srcdir)/man/common/options.md' \
+	    -e '/\[common options\]/d' \
+	    -e '/\[common tcti options\]/r $(top_srcdir)/man/common/tcti.md' \
+	    -e '/\[common tcti options\]/d' \
+	    -e '/\[common tss2 options\]/r $(top_srcdir)/man/common/tss2-options.md' \
+	    -e '/\[common tss2 options\]/d' \
+	    -e '/\[common fapi references\]/r $(top_srcdir)/man/common/tss2-fapi-references.md' \
+	    -e '/\[common fapi references\]/d' \
+	    -e '/\[authorization formatting\]/r $(top_srcdir)/man/common/authorizations.md' \
+	    -e '/\[authorization formatting\]/d' \
+	    -e '/\[context object format\]/r $(top_srcdir)/man/common/ctxobj.md' \
+	    -e '/\[context object format\]/d' \
+	    -e '/\[supported hash algorithms\]/r $(top_srcdir)/man/common/hash.md' \
+	    -e '/\[supported hash algorithms\]/d' \
+	    -e '/\[algorithm specifiers\]/r $(top_srcdir)/man/common/alg.md' \
+	    -e '/\[algorithm specifiers\]/d' \
+	    -e '/\[supported public object algorithms\]/r $(top_srcdir)/man/common/object-alg.md' \
+	    -e '/\[supported public object algorithms\]/d' \
+	    -e '/\[supported signing algorithms\]/r $(top_srcdir)/man/common/sign-alg.md' \
+	    -e '/\[supported signing algorithms\]/d' \
+	    -e '/\[nv attributes\]/r $(top_srcdir)/man/common/nv-attrs.md' \
+	    -e '/\[nv attributes\]/d' \
+	    -e '/\[pcr bank specifiers\]/r $(top_srcdir)/man/common/pcr.md' \
+	    -e '/\[pcr bank specifiers\]/d' \
+	    -e '/\[pubkey options\]/r $(top_srcdir)/man/common/pubkey.md' \
+	    -e '/\[pubkey options\]/d' \
+	    -e '/\[signature format specifiers\]/r $(top_srcdir)/man/common/signature.md' \
+	    -e '/\[signature format specifiers\]/d' \
+	    -e '/\[object attribute specifiers\]/r $(top_srcdir)/man/common/obj-attrs.md' \
+	    -e '/\[object attribute specifiers\]/d' \
+	    -e '/\[supported signing schemes\]/r $(top_srcdir)/man/common/signschemes.md' \
+	    -e '/\[supported signing schemes\]/d' \
+	    -e '/\[limitations\]/r $(top_srcdir)/man/common/policy-limitations.md' \
+	    -e '/\[limitations\]/d' \
+	    -e '/\[returns\]/r $(top_srcdir)/man/common/returns.md' \
+	    -e '/\[returns\]/d' \
+	    -e '/\[footer\]/r $(top_srcdir)/man/common/footer.md' \
+	    -e '/\[footer\]/d' \
+	    -e '/\[protection details\]/r $(top_srcdir)/man/common/protection-details.md' \
+	    -e '/\[protection details\]/d' \
+	    < $< | pandoc -s -t man > $@
+
+CLEANFILES = $(dist_man1_MANS)
+
+bashcompdir=@bashcompdir@
+dist_bashcomp_DATA=dist/bash-completion/tpm2-tools/tpm2_completion.bash
+if HAVE_FAPI
+dist_bashcomp_DATA+= \
+	dist/bash-completion/tpm2-tools/tss2_decrypt \
+	dist/bash-completion/tpm2-tools/tss2_encrypt \
+	dist/bash-completion/tpm2-tools/tss2_list \
+	dist/bash-completion/tpm2-tools/tss2_changeauth \
+	dist/bash-completion/tpm2-tools/tss2_delete \
+	dist/bash-completion/tpm2-tools/tss2_import \
+	dist/bash-completion/tpm2-tools/tss2_getinfo \
+	dist/bash-completion/tpm2-tools/tss2_createkey \
+    dist/bash-completion/tpm2-tools/tss2_createseal \
+	dist/bash-completion/tpm2-tools/tss2_exportkey \
+	dist/bash-completion/tpm2-tools/tss2_getcertificate \
+    dist/bash-completion/tpm2-tools/tss2_getplatformcertificates \
+    dist/bash-completion/tpm2-tools/tss2_gettpmblobs \
+	dist/bash-completion/tpm2-tools/tss2_setcertificate \
+    dist/bash-completion/tpm2-tools/tss2_getappdata \
+    dist/bash-completion/tpm2-tools/tss2_setappdata \
+	dist/bash-completion/tpm2-tools/tss2_sign \
+	dist/bash-completion/tpm2-tools/tss2_verifysignature \
+	dist/bash-completion/tpm2-tools/tss2_verifyquote \
+	dist/bash-completion/tpm2-tools/tss2_createnv \
+	dist/bash-completion/tpm2-tools/tss2_nvextend \
+	dist/bash-completion/tpm2-tools/tss2_nvincrement \
+	dist/bash-completion/tpm2-tools/tss2_nvread \
+	dist/bash-completion/tpm2-tools/tss2_nvsetbits \
+	dist/bash-completion/tpm2-tools/tss2_nvwrite \
+	dist/bash-completion/tpm2-tools/tss2_getdescription \
+	dist/bash-completion/tpm2-tools/tss2_setdescription \
+	dist/bash-completion/tpm2-tools/tss2_pcrextend \
+	dist/bash-completion/tpm2-tools/tss2_quote \
+	dist/bash-completion/tpm2-tools/tss2_pcrread \
+	dist/bash-completion/tpm2-tools/tss2_authorizepolicy \
+	dist/bash-completion/tpm2-tools/tss2_exportpolicy \
+	dist/bash-completion/tpm2-tools/tss2_provision \
+	dist/bash-completion/tpm2-tools/tss2_getrandom \
+	dist/bash-completion/tpm2-tools/tss2_unseal \
+	dist/bash-completion/tpm2-tools/tss2_writeauthorizenv \
+    dist/bash-completion/tpm2-tools/tss2
+endif
+
+install-data-hook:
+	cd $(DESTDIR)$(bashcompdir) && \
+	for tool in $(bin_PROGRAMS); do \
+		[ "$${tool}" = "$${tool#tools/fapi/*}" ] && $(LN_S) -f tpm2_completion.bash $${tool##*/}; \
+	done
+
+uninstall-hook:
+	cd $(DESTDIR)$(bashcompdir) && \
+	for tool in $(bin_PROGRAMS); do \
+		[ "$${tool}" = "$${tool#tools/fapi/*}" -a -L $${tool##*/} ] && rm -f $${tool##*/}; \
+	done
+
+dist-hook:
+	for f in $(EXTRA_DIST_IGNORE); do \
+		rm -rf `find $(distdir) -name $$f`; \
+	done;
+if !HAVE_PANDOC
+# If pandoc is not enabled, we want to complain that you need pandoc for make dist,
+# so hook the target and complain.
+	@(>&2 echo "You do not have pandoc, a requirement for the distribution of manpages")
+	@exit 1
+endif

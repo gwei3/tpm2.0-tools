@@ -1,239 +1,207 @@
-//**********************************************************************;
-// Copyright (c) 2015, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// 3. Neither the name of Intel Corporation nor the names of its contributors
-// may be used to endorse or promote products derived from this software without
-// specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
+/* SPDX-License-Identifier: BSD-3-Clause */
 
-#include <stdbool.h>
-
-#include <stdlib.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <getopt.h>
-#include <limits.h>
 
-#include <sapi/tpm20.h>
-
-#include "log.h"
 #include "files.h"
-#include "main.h"
-#include "options.h"
-#include "password_util.h"
-#include "tpm2_util.h"
+#include "tpm2_nv_util.h"
+#include "tpm2_tool.h"
 
 typedef struct tpm_nvwrite_ctx tpm_nvwrite_ctx;
 struct tpm_nvwrite_ctx {
-    UINT32 nv_index;
-    UINT32 auth_handle;
+    struct {
+        const char *ctx_path;
+        const char *auth_str;
+        tpm2_loaded_object object;
+    } auth_hierarchy;
+
+    TPM2_HANDLE nv_index;
+
+    BYTE nv_buffer[TPM2_MAX_NV_BUFFER_SIZE];
+    FILE *input_file;
     UINT16 data_size;
-    UINT8 nv_buffer[MAX_NV_INDEX_SIZE];
-    TPM2B_AUTH handle_passwd;
-    bool hex_passwd;
-    char *input_file;
-    TSS2_SYS_CONTEXT *sapi_context;
-    bool is_auth_session;
-    TPMI_SH_AUTH_SESSION auth_session_handle;
+    UINT16 offset;
+    char *cp_hash_path;
 };
 
-static int nv_write(tpm_nvwrite_ctx *ctx) {
+static tpm_nvwrite_ctx ctx = {
+    .data_size = TPM2_MAX_NV_BUFFER_SIZE
+};
 
-    TPMS_AUTH_COMMAND session_data = {
-        .sessionHandle = TPM_RS_PW,
-        .nonce = TPM2B_EMPTY_INIT,
-        .hmac = TPM2B_EMPTY_INIT,
-        .sessionAttributes = SESSION_ATTRIBUTES_INIT(0),
-    };
+static bool is_input_options_args_valid(ESYS_CONTEXT *ectx) {
 
-    if (ctx->is_auth_session) {
-        session_data.sessionHandle = ctx->auth_session_handle;
-    }
-
-    TPMS_AUTH_RESPONSE session_data_out;
-    TSS2_SYS_CMD_AUTHS sessions_data;
-    TSS2_SYS_RSP_AUTHS sessions_data_out;
-    TPM2B_MAX_NV_BUFFER nv_write_data;
-
-    TPMS_AUTH_COMMAND *session_data_array[1] = { &session_data };
-    TPMS_AUTH_RESPONSE *session_data_out_array[1] = { &session_data_out };
-
-    sessions_data_out.rspAuths = &session_data_out_array[0];
-    sessions_data.cmdAuths = &session_data_array[0];
-
-    sessions_data_out.rspAuthsCount = 1;
-    sessions_data.cmdAuthsCount = 1;
-
-    bool result = password_tpm2_util_to_auth(&ctx->handle_passwd, ctx->hex_passwd,
-            "handle password", &session_data.hmac);
-    if (!result) {
+    if (ctx.cp_hash_path && ctx.data_size > TPM2_MAX_NV_BUFFER_SIZE) {
+        LOG_ERR("Cannot calculat cpHash for buffers larger than NV max buffer");
         return false;
     }
 
-    while (ctx->data_size > 0) {
+    if (!ctx.data_size) {
+        LOG_WARN("Data to write is of size 0");
+    }
 
-        nv_write_data.t.size =
-                ctx->data_size > MAX_NV_BUFFER_SIZE ?
-                MAX_NV_BUFFER_SIZE : ctx->data_size;
+    /*
+     * Ensure that writes will fit before attempting write to prevent data
+     * from being partially written to the index.
+     */
+    TPM2B_NV_PUBLIC *nv_public = NULL;
+    tool_rc rc = tpm2_util_nv_read_public(ectx, ctx.nv_index, &nv_public);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Failed to write NVRAM public area at index 0x%X",
+                ctx.nv_index);
+        free(nv_public);
+        return false;
+    }
 
-        LOG_INFO("The data(size=%d) to be written:\n", nv_write_data.t.size);
+    if (ctx.offset + ctx.data_size > nv_public->nvPublic.dataSize) {
+        LOG_ERR("The starting offset (%u) and the size (%u) are larger than the"
+                " defined space: %u.", ctx.offset, ctx.data_size,
+                nv_public->nvPublic.dataSize);
+        free(nv_public);
+        return false;
+    }
+    free(nv_public);
+    return true;
+}
 
-        UINT16 i;
-        UINT16 offset = 0;
-        for (i = 0; i < nv_write_data.t.size; i++) {
-            nv_write_data.t.buffer[i] = ctx->nv_buffer[offset + i];
-            printf("%02x ", ctx->nv_buffer[offset + i]);
+static tool_rc nv_write(ESYS_CONTEXT *ectx) {
+
+    TPM2B_MAX_NV_BUFFER nv_write_data;
+    UINT16 data_offset = 0;
+
+    if (ctx.cp_hash_path) {
+        nv_write_data.size = ctx.data_size;
+        memcpy(nv_write_data.buffer, &ctx.nv_buffer, ctx.data_size);
+        LOG_WARN("Calculating cpHash. Exiting without performing write.");
+        TPM2B_DIGEST cp_hash = { .size = 0 };
+        tool_rc rc = tpm2_nvwrite(ectx, &ctx.auth_hierarchy.object, ctx.nv_index,
+                &nv_write_data, ctx.offset, &cp_hash);
+        if (rc != tool_rc_success) {
+            LOG_ERR("CpHash calculation failed!");
+            return rc;
         }
-        printf("\n\n");
 
-        TPM_RC rval = Tss2_Sys_NV_Write(ctx->sapi_context, ctx->auth_handle,
-                ctx->nv_index, &sessions_data, &nv_write_data, offset,
-                &sessions_data_out);
-        if (rval != TSS2_RC_SUCCESS) {
-            LOG_ERR(
-                    "Failed to write NV area at index 0x%x (%d) offset 0x%x. Error:0x%x",
-                    ctx->nv_index, ctx->nv_index, offset, rval);
+        bool result = files_save_digest(&cp_hash, ctx.cp_hash_path);
+        if (!result) {
+            rc = tool_rc_general_error;
+        }
+        return rc;
+    }
+
+    UINT32 max_data_size;
+    tool_rc rc = tpm2_util_nv_max_buffer_size(ectx, &max_data_size);
+    if (rc != tool_rc_success) {
+        return rc;
+    }
+
+    if (max_data_size > TPM2_MAX_NV_BUFFER_SIZE) {
+        max_data_size = TPM2_MAX_NV_BUFFER_SIZE;
+    } else if (max_data_size == 0) {
+        max_data_size = NV_DEFAULT_BUFFER_SIZE;
+    }
+
+    while (ctx.data_size > 0) {
+
+        nv_write_data.size =
+                ctx.data_size > max_data_size ? max_data_size : ctx.data_size;
+
+        LOG_INFO("The data(size=%d) to be written:", nv_write_data.size);
+
+        memcpy(nv_write_data.buffer, &ctx.nv_buffer[data_offset],
+                nv_write_data.size);
+
+        rc = tpm2_nvwrite(ectx, &ctx.auth_hierarchy.object, ctx.nv_index,
+                &nv_write_data, ctx.offset + data_offset, NULL);
+        if (rc != tool_rc_success) {
+            return rc;
+        }
+
+        ctx.data_size -= nv_write_data.size;
+        data_offset += nv_write_data.size;
+    }
+
+    return tool_rc_success;
+}
+
+static bool on_option(char key, char *value) {
+    char *input_file;
+    switch (key) {
+    case 'C':
+        ctx.auth_hierarchy.ctx_path = value;
+        break;
+    case 'P':
+        ctx.auth_hierarchy.auth_str = value;
+        break;
+    case 'i':
+        input_file = strcmp("-", value) ? value : NULL;
+        return files_load_bytes_from_buffer_or_file_or_stdin(NULL, input_file,
+                &ctx.data_size, ctx.nv_buffer);
+        break;
+    case 0:
+        if (!tpm2_util_string_to_uint16(value, &ctx.offset)) {
+            LOG_ERR("Could not convert starting offset, got: \"%s\"", value);
             return false;
         }
-
-        LOG_INFO("Success to write NV area at index 0x%x (%d) offset 0x%x.",
-                ctx->nv_index, ctx->nv_index, offset);
-
-        ctx->data_size -= nv_write_data.t.size;
-        offset += nv_write_data.t.size;
+        break;
+    case 1:
+        ctx.cp_hash_path = value;
+        break;
     }
 
     return true;
 }
 
-static bool init(int argc, char *argv[], tpm_nvwrite_ctx *ctx) {
-
-    struct option long_options[] = {
-        { "index"       , required_argument, NULL, 'x' },
-        { "authHandle"  , required_argument, NULL, 'a' },
-        { "file"        , required_argument, NULL, 'f' },
-        { "handlePasswd", required_argument, NULL, 'P' },
-        { "passwdInHex" , no_argument,       NULL, 'X' },
-        { "input-session-handle",1,          NULL, 'S' },
-        { NULL          , no_argument,       NULL,  0  },
-    };
-
-    int opt;
-    bool result;
-    while ((opt = getopt_long(argc, argv, "x:a:f:P:S:X", long_options, NULL))
-            != -1) {
-        switch (opt) {
-        case 'x':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->nv_index);
-            if (!result) {
-                LOG_ERR("Could not convert NV index to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-
-            if (ctx->nv_index == 0) {
-                LOG_ERR("NV Index cannot be 0");
-                return false;
-            }
-            break;
-        case 'a':
-            result = tpm2_util_string_to_uint32(optarg, &ctx->auth_handle);
-            if (!result) {
-                LOG_ERR("Could not convert auth handle to number, got: \"%s\"",
-                        optarg);
-                return false;
-            }
-
-            if (ctx->auth_handle == 0) {
-                LOG_ERR("Auth handle cannot be 0");
-                return false;
-            }
-            break;
-        case 'f':
-            ctx->input_file = optarg;
-            break;
-        case 'P':
-            result = password_tpm2_util_copy_password(optarg, "handle password",
-                    &ctx->handle_passwd);
-            if (!result) {
-                return false;
-            }
-            break;
-        case 'X':
-            ctx->hex_passwd = true;
-            break;
-        case 'S':
-             if (!tpm2_util_string_to_uint32(optarg, &ctx->auth_session_handle)) {
-                 LOG_ERR("Could not convert session handle to number, got: \"%s\"",
-                         optarg);
-                 return false;
-             }
-             ctx->is_auth_session = true;
-             break;
-        case ':':
-            LOG_ERR("Argument %c needs a value!\n", optopt);
-            return false;
-        case '?':
-            LOG_ERR("Unknown Argument: %c\n", optopt);
-            return false;
-        default:
-            LOG_ERR("?? getopt returned character code 0%o ??\n", opt);
-            return false;
-        }
+static bool on_arg(int argc, char **argv) {
+    /* If the user doesn't specify an authorization hierarchy use the index
+     * passed to -x/--index for the authorization index.
+     */
+    if (!ctx.auth_hierarchy.ctx_path) {
+        ctx.auth_hierarchy.ctx_path = argv[0];
     }
-
-    ctx->data_size = MAX_NV_INDEX_SIZE;
-    result = files_load_bytes_from_file(ctx->input_file, ctx->nv_buffer, &ctx->data_size);
-    if (!result) {
-        LOG_ERR("Failed to read data from %s\n", ctx->input_file);
-        return -false;
-    }
-
-    return true;
+    return on_arg_nv_index(argc, argv, &ctx.nv_index);
 }
 
-int execute_tool(int argc, char *argv[], char *envp[], common_opts_t *opts,
-        TSS2_SYS_CONTEXT *sapi_context) {
+static bool tpm2_tool_onstart(tpm2_options **opts) {
 
-    (void)opts;
-    (void)envp;
-
-    tpm_nvwrite_ctx ctx = {
-        .nv_index = 0,
-        .auth_handle = TPM_RH_PLATFORM,
-        .data_size = 0,
-        .handle_passwd = TPM2B_EMPTY_INIT,
-        .hex_passwd = false,
-        .sapi_context = sapi_context
+    const struct option topts[] = {
+        { "hierarchy",            required_argument, NULL, 'C' },
+        { "auth",                 required_argument, NULL, 'P' },
+        { "input",                required_argument, NULL, 'i' },
+        { "offset",               required_argument, NULL,  0  },
+        { "cphash",               required_argument, NULL,  1  },
     };
 
-    bool result = init(argc, argv, &ctx);
-    if (!result) {
-        return 1;
+    *opts = tpm2_options_new("C:P:i:", ARRAY_LEN(topts), topts, on_option,
+            on_arg, 0);
+
+    return *opts != NULL;
+}
+
+static tool_rc tpm2_tool_onrun(ESYS_CONTEXT *ectx, tpm2_option_flags flags) {
+
+    UNUSED(flags);
+
+    bool retval = is_input_options_args_valid(ectx);
+    if (!retval) {
+        return tool_rc_option_error;
     }
 
-    return nv_write(&ctx) != true;
+    tool_rc rc = tpm2_util_object_load_auth(ectx, ctx.auth_hierarchy.ctx_path,
+            ctx.auth_hierarchy.auth_str, &ctx.auth_hierarchy.object, false,
+            TPM2_HANDLE_FLAGS_NV | TPM2_HANDLE_FLAGS_O | TPM2_HANDLE_FLAGS_P);
+    if (rc != tool_rc_success) {
+        LOG_ERR("Invalid handle authorization");
+        return rc;
+    }
+
+    return nv_write(ectx);
 }
+
+static tool_rc tpm2_tool_onstop(ESYS_CONTEXT *ectx) {
+    UNUSED(ectx);
+    return tpm2_session_close(&ctx.auth_hierarchy.object.session);
+}
+
+// Register this tool with tpm2_tool.c
+TPM2_TOOL_REGISTER("nvwrite", tpm2_tool_onstart, tpm2_tool_onrun, tpm2_tool_onstop, NULL)

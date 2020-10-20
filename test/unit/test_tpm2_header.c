@@ -1,41 +1,17 @@
-//**********************************************************************;
-// Copyright (c) 2016, Intel Corporation
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-// this list of conditions and the following disclaimer.
-//
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-// this list of conditions and the following disclaimer in the documentation
-// and/or other materials provided with the distribution.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//**********************************************************************;
-#include <stdarg.h>
-#include <stddef.h>
-#include <setjmp.h>
+/* SPDX-License-Identifier: BSD-3-Clause */
 
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#include <setjmp.h>
 #include <cmocka.h>
-#include <sapi/tpm20.h>
 
 #include "tpm2_header.h"
 
 static void test_tpm_command_header(void **state) {
 
-    (void)state;
+    (void) state;
 
     UINT8 command_bytes[] = {
       0x80, 0x01, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x01, 0x7a, 0x00, 0x00,
@@ -52,12 +28,13 @@ static void test_tpm_command_header(void **state) {
     assert_memory_equal(c->bytes, command_bytes, sizeof(command_bytes));
 
     /* everything from data should be the same */
-    assert_memory_equal(c->data, command_bytes + 10, sizeof(command_bytes) - 10);
+    assert_memory_equal(c->data, command_bytes + 10,
+            sizeof(command_bytes) - 10);
 
     TPMI_ST_COMMAND_TAG tag = tpm2_command_header_get_tag(c);
     UINT32 size_with_header = tpm2_command_header_get_size(c, true);
     UINT32 size_with_out_header = tpm2_command_header_get_size(c, false);
-    TPM_CC cc = tpm2_command_header_get_code(c);
+    TPM2_CC cc = tpm2_command_header_get_code(c);
 
     assert_true(tag == 0x8001);
     assert_true(size_with_header == 0x16);
@@ -67,7 +44,7 @@ static void test_tpm_command_header(void **state) {
 
 static void test_tpm_response_header(void **state) {
 
-    (void)state;
+    (void) state;
 
     unsigned char response_bytes[] = {
       0x80, 0x01, 0x00, 0x00, 0x02, 0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -127,7 +104,8 @@ static void test_tpm_response_header(void **state) {
     assert_memory_equal(r->bytes, response_bytes, sizeof(response_bytes));
 
     /* everything from data should be the same */
-    assert_memory_equal(r->data, response_bytes + 10, sizeof(response_bytes) - 10);
+    assert_memory_equal(r->data, response_bytes + 10,
+            sizeof(response_bytes) - 10);
 
     TPMI_ST_COMMAND_TAG tag = tpm2_response_header_get_tag(r);
     UINT32 size_with_header = tpm2_response_header_get_size(r, true);
@@ -140,9 +118,14 @@ static void test_tpm_response_header(void **state) {
     assert_true(rc == 0x00);
 }
 
+/* link required symbol, but tpm2_tool.c declares it AND main, which
+ * we have a main below for cmocka tests.
+ */
+bool output_enabled = true;
+
 int main(int argc, char* argv[]) {
-    (void)argc;
-    (void)argv;
+    (void) argc;
+    (void) argv;
 
     const struct CMUnitTest tests[] = {
         cmocka_unit_test(test_tpm_command_header),
